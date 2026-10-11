@@ -471,12 +471,32 @@ mod tests {
                     dirs.push(p);
                 } else if p.extension().is_some_and(|e| e == "rs") {
                     let text = std::fs::read_to_string(&p).unwrap_or_default();
-                    let cut = text.find("#[cfg(test)]\nmod tests").unwrap_or(text.len());
-                    out.push((p.display().to_string(), text[..cut].to_string()));
+                    out.push((p.display().to_string(), source_before_tests(&text)));
                 }
             }
         }
         out
+    }
+
+    fn source_before_tests(text: &str) -> String {
+        // Windows checkouts may use CRLF; the source scanner treats both forms identically.
+        let text = text.replace("\r\n", "\n");
+        let cut = text.find("#[cfg(test)]\nmod tests").unwrap_or(text.len());
+        text[..cut].to_string()
+    }
+
+    #[test]
+    fn source_scan_keeps_production_literals_with_lf_and_crlf() {
+        let production = "fn view() { tl!(\"File\"); }\n";
+        let source = format!("{production}#[cfg(test)]\nmod tests {{ fn fixture() {{ tl!(r\"not a UI label\"); }} }}\n");
+        for text in [source.clone(), source.replace('\n', "\r\n")] {
+            let scanned = source_before_tests(&text);
+            assert_eq!(scanned, production);
+            assert_eq!(tl_literals(&scanned), ["File"]);
+            assert!(!scanned.contains("tl!(r"));
+        }
+        assert_eq!(source_before_tests(production), production);
+        assert!(source_before_tests("fn view() { tl!(r\"invalid production label\"); }\r\n").contains("tl!(r"));
     }
 
     /// The (unescaped) string literals passed to `tl!` and `tlf!` in a source file.
