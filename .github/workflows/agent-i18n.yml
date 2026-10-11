@@ -52,6 +52,31 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: agent-i18n-windows
+      - name: Use preinstalled Windows SDK DXC for GPU tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $sdkBins = Get-ChildItem -LiteralPath $sdkRoot -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object { [Version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64' }
+          $sdkBin = $sdkBins | Where-Object {
+            (Test-Path -LiteralPath (Join-Path $_ 'dxcompiler.dll') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $_ 'dxil.dll') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $_ 'dxc.exe') -PathType Leaf)
+          } | Select-Object -First 1
+          if (-not $sdkBin) { throw 'Preinstalled Windows SDK DXC is required for GPU parity' }
+          $dxcDll = Join-Path $sdkBin 'dxcompiler.dll'
+          $productVersion = (Get-Item -LiteralPath $dxcDll).VersionInfo.ProductVersion
+          $version = [Version]($productVersion.Split(' ')[0])
+          if ($version -lt [Version]'1.8.2502.0') { throw "DXC is too old for wgpu 30: $productVersion" }
+          & (Join-Path $sdkBin 'dxc.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'Preinstalled SDK DXC verification failed' }
+          # wgpu's Auto compiler loads dxcompiler.dll by name; without the SDK on
+          # this job's PATH it falls back to the runner's failing legacy FXC.
+          Write-Output "GPU tests will use existing SDK DXC $productVersion from $sdkBin"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $sdkBin -Encoding utf8
       - name: Verify portable external test oracles
         shell: pwsh
         run: |
@@ -77,6 +102,18 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "FILMCRAFT_FFMPEG=$ffmpeg" -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "FILMCRAFT_FFPROBE=$ffprobe" -Encoding utf8
       - run: cargo fmt --all --check
+      - name: Verify GPU golden parity with SDK DXC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:RUNNER_TEMP 'filmcraft-gpu-parity.log'
+          cargo test -p filmcraft-golden --test golden --locked -j1 gpu_ -- --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath $log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "GPU golden parity failed (exit $testExit)" }
+          $output = Get-Content -LiteralPath $log -Raw
+          if ($output -match '(?im)^.*SKIPPED.*(?:gpu|adapter)') { throw 'GPU parity requires an adapter; skipping is forbidden in CI' }
+          if ($output -notmatch 'test result: ok\. 4 passed; 0 failed; 0 ignored;') { throw 'All four GPU golden parity tests must run' }
       - run: cargo clippy --workspace --all-targets --locked -j1 -- -D warnings
       - run: cargo test --workspace --locked -j1 -- --test-threads=1
       - run: cargo xtask layers
