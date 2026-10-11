@@ -1,4 +1,4 @@
-//! Client for the desktop app's JSON-lines control protocol. One connection, reconnect on failure.
+//! Client for the desktop control protocol. Reconnect on the next call; never replay a lost reply.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -69,7 +69,9 @@ impl BridgeClient {
     /// Call a control method; returns `result` or the app's error.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, AutomationError> {
         let mut guard = self.conn.lock().await;
-        for attempt in 0..2 {
+        // Never replay a transmitted command: a lost reply may follow a successful edit/export.
+        // The next call reconnects; versioned mutations retain the uncertain result by request id.
+        {
             if guard.is_none() {
                 let s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.addr))
                     .await
@@ -90,25 +92,27 @@ impl BridgeClient {
                     .await
                     .map_err(|_| AutomationError::Bridge("timeout".into()))?
                     .map_err(|e| AutomationError::Bridge(e.to_string()))?;
-                serde_json::from_str(&buf).map_err(|e| AutomationError::Bridge(format!("bad reply: {e}")))
+                let reply: Value = serde_json::from_str(&buf).map_err(|e| AutomationError::Bridge(format!("bad reply: {e}")))?;
+                if reply["id"].as_u64() != Some(id) {
+                    return Err(AutomationError::Bridge("reply id does not match the request".into()));
+                }
+                Ok(reply)
             }
             .await;
             match res {
                 Ok(v) => {
-                    return if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                    if v.get("ok").and_then(Value::as_bool) == Some(true) {
                         Ok(v.get("result").cloned().unwrap_or(Value::Null))
                     } else {
                         Err(AutomationError::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string()))
-                    };
+                    }
                 }
-                Err(e) if attempt == 0 => {
+                Err(e) => {
                     *guard = None;
-                    let _ = e;
+                    Err(AutomationError::Bridge(format!("delivery uncertain; inspect the App before issuing a new mutation: {e}")))
                 }
-                Err(e) => return Err(e),
             }
         }
-        Err(AutomationError::Bridge("unreachable".into()))
     }
 }
 
@@ -117,6 +121,38 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn lost_reply_does_not_replay_a_mutation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            seen.lock().await.push(serde_json::from_str::<Value>(&line).unwrap());
+            drop(reader); // The App may have committed the edit before its reply was lost.
+            let (socket, _) = listener.accept().await.unwrap();
+            let (r, mut w) = socket.into_split();
+            line.clear();
+            BufReader::new(r).read_line(&mut line).await.unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            seen.lock().await.push(req.clone());
+            w.write_all(format!("{}\n", json!({"id":req["id"],"ok":true,"result":{"revision":1}})).as_bytes()).await.unwrap();
+        });
+        let bridge = BridgeClient::new(addr).unwrap();
+        let err = bridge.execute("file.newProject", json!({"name":"Once"})).await.unwrap_err();
+        assert!(err.to_string().contains("delivery uncertain"));
+        bridge.execute("project.inspect", json!({})).await.unwrap();
+        task.await.unwrap();
+        let requests = log.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"]["command"], "file.newProject");
+        assert_eq!(requests[1]["params"]["command"], "project.inspect");
+    }
 
     /// A stand-in for the app's control server: the export starts job 7, which `jobs.list` reports
     /// running twice and then finished with `result`. Every request is recorded.

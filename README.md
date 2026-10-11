@@ -1,13 +1,3 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
-
-
 <h1 align="center">FilmCraft</h1>
 
 <p align="center">
@@ -16,7 +6,7 @@
 
 <p align="center">
   An open-source, clean-room take on the Adobe Premiere Pro workflow: native on macOS, Windows and Linux, and in the browser via WebAssembly.<br>
-  By the ArtCraft team.
+  This modified build is based on FilmCraft by the ArtCraft team.
 </p>
 
 <p align="center">
@@ -221,10 +211,10 @@ Import merges the document's bins, media and sequences into your project as one 
 
 ## Built for agents
 
-Every menu item, button, slider and drag in FilmCraft is a **command** with an id, typed parameters and an enabled state. There are more than 650 engine commands (`filmcraft-cli commands` lists them), with the rest of Premiere's catalogue on the way. The UI, the CLI, a JSON control channel and an **MCP server** all dispatch the same commands, so Claude or any agent can cut, trim, grade, mix and export exactly the way a person does. The UI can also be driven at the level of mouse and keyboard: every widget has an automation id, and agents can click, drag, type and take screenshots.
+Every menu item, button, slider and drag in FilmCraft is a **command** with an id, typed parameters and an enabled state. There are more than 650 engine commands (`filmcraft-cli commands` lists them), with the rest of Premiere's catalogue on the way. The UI, CLI and trusted local JSON control channel use these commands. Workspace-scoped **MCP v1** exposes project, media, timeline, history and MP4 export operations through the same App session, with revision and confirmation guards. The trusted control channel also supports mouse and keyboard input through widget automation ids; scoped MCP provides UI inspection and screenshots. See the [integration guide](docs/agent-integration.md) for the supported tools and limits.
 
 ```jsonc
-// over the control channel (JSON lines on TCP) or as MCP tool calls
+// over the trusted control channel (JSON lines on loopback TCP)
 {"method": "engine.execute", "params": {"command": "timeline.place",
   "params": {"item": 1, "track": "V1", "seconds": 0, "sourceIn": 284298240000000, "duration": 1270080000000}}}
 {"method": "engine.execute", "params": {"command": "effects.setParam",
@@ -250,7 +240,7 @@ The trailer and the grades in these screenshots were built exactly this way, by 
 cargo run --release -p filmcraft                           # the desktop app, with a demo project
 cargo run --release -p filmcraft -- --control 9876         # plus the JSON-lines control server
 cargo run --release -p filmcraft-cli -- commands           # list every engine command
-cargo run --release -p filmcraft-cli -- mcp                # MCP server (headless)
+cargo run --release -p filmcraft-cli -- mcp --workspace /absolute/media-workspace # existing directory; headless engine
 ```
 
 Japanese text in the interface and in titles comes from [craft-fonts](https://github.com/storytold/craft-fonts), an optional build input (release builds always include it; without it FilmCraft uses its own and the system's fonts):
@@ -428,6 +418,19 @@ And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video stud
 
 <br>
 
+## Languages and App MCP
+
+English, 繁體中文 (`zh-TW`) and 日本語 (`ja`) are available from Edit → Language,
+alongside Spanish and Brazilian Portuguese. The selection is saved; missing translations
+fall back to English. Main editing, media, timeline, monitor, export and menu surfaces are
+translated. Some secondary dialogs and diagnostic details still use English.
+
+The stdio MCP server can operate the real desktop App through its shared command layer.
+It requires an explicit local `--workspace` and provides versioned project, import,
+timeline, undo/redo and export-job tools with revision, retry and confirmation checks.
+See the complete **[English / 繁體中文 / 日本語 integration guide](docs/agent-integration.md)**
+for startup commands, client configuration, schemas, examples and limitations.
+
 ## License and credits
 
 FilmCraft is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
@@ -440,20 +443,17 @@ with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md). Builds 
 
 **Footage and music in the screenshots:** NASA's Apollo 11 film and television footage from [images.nasa.gov](https://images.nasa.gov) (launch, Launch Control Center, lunar surface and recovery) and the Apollo 11 air-to-ground voice transcript, all US Government works in the public domain (NASA does not endorse this project); *Night of the Living Dead* (1968), *Carnival of Souls* (1962) and *Charade* (1963), all in the US public domain; *Earth Views from the ISS* by NASA; Chopin's Nocturne Op. 48 No. 1 and Ballade No. 1, performed for Musopen and released under CC0. The media itself is not in this repository. Sources and details for every asset are in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-FilmCraft is an independent implementation. It contains no Adobe code, icons, images, presets or LUTs, and no GPL or LGPL code; every icon is drawn in code and every asset is openly licensed and attributed ([AGENTS.md](AGENTS.md)), apart from the ArtCraft name and logos, which are trademarks of the ArtCraft Team used under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt). ffmpeg is used only as an external test oracle.
+FilmCraft is an independent implementation. It contains no Adobe code, icons, images, presets or LUTs, and no GPL or LGPL code; every icon is drawn in code and every asset is openly licensed and attributed ([AGENTS.md](AGENTS.md)). ffmpeg is used only as an external test oracle. This modified build removes upstream trademark artwork as required by the repository rules.
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and FilmCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The original trademark terms remain in [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt)
+for reference; this modified build does not bundle the marks.
 
 <sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. FilmCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <br>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <sub>Based on FilmCraft by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
 
 ## Star history

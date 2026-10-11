@@ -7,6 +7,7 @@ const VALUED: &[&str] = &[
     "--project",
     "--save-as",
     "--bridge",
+    "--workspace",
     "--format",
     "--scale",
     "--quality",
@@ -119,6 +120,14 @@ mod tests {
         let b = args("--bridge=127.0.0.1:9876 inspect sequence");
         assert_eq!(b.opt("--bridge"), Some("127.0.0.1:9876"));
         assert_eq!(b.pos(1), Some("sequence"));
+    }
+
+    #[test]
+    fn mcp_workspace_is_a_value_including_spaces() {
+        let a = Args::parse(["mcp", "--workspace", "C:\\FilmCraft Work", "--bridge", "127.0.0.1:9876"].map(str::to_string));
+        assert_eq!(a.positionals, ["mcp"]);
+        assert_eq!(a.opt("--workspace"), Some("C:\\FilmCraft Work"));
+        assert_eq!(a.opt("--bridge"), Some("127.0.0.1:9876"));
     }
 
     #[test]

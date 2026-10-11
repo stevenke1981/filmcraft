@@ -45,7 +45,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     // Community and project links.
     let y = 90.0 + 150.0 + 36.0;
-    // ArtCraft wordmark (first-party trademark, docs/brand/), then the section title.
+    // Plain application title, then the section title.
     let logo = crate::brand::paint_wordmark(ui, rect.min + vec2(24.0, y), 15.0, app.ui.dark);
     let tx = logo.map_or(rect.min.x + 24.0, |r| r.max.x + 12.0);
     ui.painter().text(pos2(tx, rect.min.y + y), Align2::LEFT_CENTER, tl!("Community"), Tokens::semibold(15.0), t.text);

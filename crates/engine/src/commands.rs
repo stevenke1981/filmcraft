@@ -1154,7 +1154,7 @@ fn build() -> Vec<CommandSpec> {
             "Media…",
             ["File", "Export"],
             None,
-            r#"{"path":str,"preset":str?,"settings":ExportSettings?,"format":"h264|hevc|prores|dnxhr|apv|mjpeg|mxf-op1a|mxf-opatom|png|tiff|bmp|gif|wav|aiff"?,"width":u32?,"height":u32?,"fps":f64?,"bitrateKbps":u32?,"bitrateMode":"cbr|vbr1Pass|vbr2Pass"?,"hardwareEncoding":"off|auto"?,"scale":f32=1,"audio":bool=true,"quality":0..100,"burnCaptions":bool=false,"alpha":bool=false,"captionSidecar":"srt|vtt"?,"loudnessLufs":f64?,"proresProfile":"proxy|lt|standard|hq"?,"dnxProfile":"lb|sq|hq|hqx"?,"apvProfile":"422-10|422-12|444-10|444-12"?,"mxfVideoCodec":"dnxhr|proRes|h264"?,"sequence":id?,"range":"entire|inOut|workArea|custom"?,"startSeconds":f64?,"endSeconds":f64?,"wait":bool=false}"#,
+            r#"{"path":str,"preset":str?,"settings":ExportSettings?,"format":"h264|hevc|prores|dnxhr|apv|mjpeg|mxf-op1a|mxf-opatom|png|tiff|bmp|gif|wav|aiff"?,"width":u32?,"height":u32?,"fps":f64?,"bitrateKbps":u32?,"bitrateMode":"cbr|vbr1Pass|vbr2Pass"?,"hardwareEncoding":"off|auto"?,"removeCancelledOutput":bool=false,"scale":f32=1,"audio":bool=true,"quality":0..100,"burnCaptions":bool=false,"alpha":bool=false,"captionSidecar":"srt|vtt"?,"loudnessLufs":f64?,"proresProfile":"proxy|lt|standard|hq"?,"dnxProfile":"lb|sq|hq|hqx"?,"apvProfile":"422-10|422-12|444-10|444-12"?,"mxfVideoCodec":"dnxhr|proRes|h264"?,"sequence":id?,"range":"entire|inOut|workArea|custom"?,"startSeconds":f64?,"endSeconds":f64?,"wait":bool=false}"#,
             has_seq,
             crate::export_tools::export_media
         ),
@@ -2640,6 +2640,26 @@ fn build() -> Vec<CommandSpec> {
             ))
         }),
         query!("project.inspect", "Inspect Project", "{}", |s, _| Ok(crate::commands::inspect_project(s))),
+        query!("project.document", "Inspect Project References", "{}", |s, _| {
+            serde_json::to_value(&*s.project).map_err(|e| EngineError::Other(e.to_string()))
+        }),
+        query!("agent.inspect", "Inspect Agent Snapshot", "{}", |s, _| {
+            let document = serde_json::to_value(&*s.project).map_err(|e| EngineError::Other(e.to_string()))?;
+            let sequence = s.state.active_sequence.and_then(|id| s.project.sequence(id).map(|q| inspect_sequence(s, id, q)));
+            Ok(json!({"document":document,"project":inspect_project(s),"sequence":sequence}))
+        }),
+        query!("agent.execute", "Agent Command", r#"{"revision":u64,"command":str,"params":object}"#, |s, p| {
+            let revision = u64_p(p, "revision").ok_or_else(|| bad("agent.execute", "need `revision`"))?;
+            if revision != s.revision {
+                return Err(bad("agent.execute", "revision conflict; inspect the project again"));
+            }
+            let id = str_p(p, "command").ok_or_else(|| bad("agent.execute", "need `command`"))?;
+            if id.starts_with("agent.") {
+                return Err(bad("agent.execute", "nested agent commands are unsupported"));
+            }
+            let params = p.get("params").filter(|v| v.is_object()).ok_or_else(|| bad("agent.execute", "need object `params`"))?.clone();
+            s.execute(id, params)
+        }),
         query!("sequence.inspect", "Inspect Sequence", r#"{"item":id?}"#, |s, p| {
             let id = item_p(p, "item").or(s.state.active_sequence).ok_or(EngineError::NoSequence)?;
             let q = s.project.sequence(id).ok_or(EngineError::NoSequence)?;

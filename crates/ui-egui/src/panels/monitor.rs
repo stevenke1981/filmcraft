@@ -28,7 +28,8 @@ pub enum Which {
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
-    let controls_h = 28.0 + 24.0 + 36.0;
+    let compact_controls = rect.width() < 430.0;
+    let controls_h = 28.0 + 24.0 + 36.0 + if compact_controls { 28.0 } else { 0.0 };
     let video_area = Rect::from_min_max(rect.min + vec2(4.0, 4.0), pos2(rect.max.x - 4.0, rect.max.y - controls_h));
     // the Source monitor's time ruler starts at `origin` (a subclip restricted to its range)
     let mut origin = Tick::ZERO;
@@ -310,7 +311,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     let dur_tc = format_time(mark_out.map(|o| o + rate.frame_duration()).unwrap_or(duration) - range_start, rate, drop_frame, TimeDisplay::Timecode, 48000);
     ui.painter().text(pos2(row1.max.x, row1.center().y), Align2::RIGHT_CENTER, &dur_tc, Tokens::timecode(), t.text_dim);
     // zoom + resolution dropdowns centred-ish
-    let zr = Rect::from_min_size(pos2(row1.min.x + 116.0, row1.min.y), vec2(70.0, 24.0));
+    let control_row = row1.translate(vec2(0.0, if compact_controls { 28.0 } else { 0.0 }));
+    let zr = Rect::from_min_size(pos2(control_row.min.x + if compact_controls { 0.0 } else { 116.0 }, control_row.min.y), vec2(70.0, 24.0));
     let zoom_label = match mv.zoom {
         None => tl!("Fit").to_string(),
         Some(z) => format!("{}%", (z * 100.0).round() as i32),
@@ -319,7 +321,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     app.auto.add(&format!("{prefix}.zoom"), zr, "Select Zoom Level");
     monitor_view::zoom_menu(app, &zresp, which);
     let res = mv.res;
-    let rr = Rect::from_min_size(pos2(row1.max.x - 196.0, row1.min.y), vec2(62.0, 24.0));
+    let rr = Rect::from_min_size(pos2(if compact_controls { zr.max.x + 8.0 } else { control_row.max.x - 196.0 }, control_row.min.y), vec2(62.0, 24.0));
     if which == Which::Source && rr.min.x > zr.max.x + 12.0 {
         crate::panels::source_drag::controls(app, ui, Rect::from_min_max(pos2(zr.max.x + 6.0, row1.min.y), pos2(rr.min.x - 6.0, row1.min.y + 24.0)));
     }
@@ -332,7 +334,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             }
         }
     });
-    let wr = Rect::from_min_size(pos2(rr.max.x + 6.0, row1.min.y + 1.0), vec2(22.0, 22.0));
+    let wr = Rect::from_min_size(pos2(rr.max.x + 6.0, control_row.min.y + 1.0), vec2(22.0, 22.0));
     let wresp = ui.interact(wr, egui::Id::new((prefix, "wrench")), Sense::click());
     icons::paint(ui.painter(), wr.shrink(4.0), Icon::Wrench, if wresp.hovered() { t.tab_text_active } else { t.icon });
     app.auto.add(&format!("{prefix}.settings"), wr, "Settings");
@@ -388,7 +390,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         }
     });
     // ---- mini timeline / scrub bar
-    let bar = Rect::from_min_size(pos2(rect.min.x + 14.0, row1.max.y + 2.0), vec2(rect.width() - 28.0, 22.0));
+    let bar = Rect::from_min_size(pos2(rect.min.x + 14.0, control_row.max.y + 2.0), vec2(rect.width() - 28.0, 22.0));
     mini_timeline(app, ui, bar, which, origin, time, duration, rate, mark_in, mark_out);
 
     // ---- transport buttons

@@ -55,9 +55,14 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         x += gw + 24.0;
     }
     let mut left_end = x;
+    let ws = crate::i18n::t(&app.ui.workspace).to_uppercase();
+    let wg = p.layout_no_wrap(ws.clone(), Tokens::ui(11.0), t.text_dim);
+    let community = p.layout_no_wrap("Discord".to_string(), Tokens::ui(12.0), Color32::WHITE);
+    let community_width = community.size().x + 34.0;
     // In-window menus when there is no native menu bar.
     if app.ui.show_menu_bar {
-        let menu_rect = Rect::from_min_max(pos2(x + 6.0, rect.min.y + 7.0), pos2(x + 520.0, rect.max.y - 7.0));
+        let right = rect.max.x - 14.0 - 6.0 * 38.0 - wg.size().x + 10.0 - community_width - 14.0 - 12.0;
+        let menu_rect = Rect::from_min_max(pos2(x + 6.0, rect.min.y + 7.0), pos2(right.max(x + 32.0), rect.max.y - 7.0));
         let mut mu = ui.new_child(egui::UiBuilder::new().max_rect(menu_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
         mu.style_mut().visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         mu.style_mut().visuals.widgets.inactive.bg_stroke = Stroke::NONE;
@@ -102,17 +107,14 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     crate::panels::export_mode::quick_export(app, ui.ctx(), pos2(qx - 340.0, rect.max.y + 4.0));
     let ws_resp = btn(ui, Icon::Workspaces, "workspaces", tl!("Workspaces"), app);
     // workspace name (caps)
-    let ws = crate::i18n::t(&app.ui.workspace).to_uppercase();
-    let wg = p.layout_no_wrap(ws.clone(), Tokens::ui(11.0), t.text_dim);
     let wr = Rect::from_min_size(pos2(rx - wg.size().x + 10.0, rect.center().y - 10.0), vec2(wg.size().x + 8.0, 20.0));
     let wresp = ui.interact(wr, egui::Id::new("hdr-ws-name"), Sense::click());
     app.auto.add("header.workspaceName", wr, &ws);
     p.galley_with_override_text_color(pos2(wr.min.x + 4.0, rect.center().y - wg.size().y / 2.0), wg, if wresp.hovered() { t.text } else { t.text_dim });
     // Community: a labelled Discord button, always one click away.
     {
-        let label = "Discord";
-        let g = p.layout_no_wrap(label.to_string(), Tokens::ui(12.0), Color32::WHITE);
-        let w = g.size().x + 34.0;
+        let g = community;
+        let w = community_width;
         let r = Rect::from_min_size(pos2(wr.min.x - w - 14.0, rect.center().y - 12.0), vec2(w, 24.0));
         let resp = ui.interact(r, egui::Id::new("hdr-discord"), Sense::click()).on_hover_text(tl!("Join the ArtCraft Discord (discord.gg/artcraft)"));
         app.auto.add("header.discord", r, "Join the ArtCraft Discord");

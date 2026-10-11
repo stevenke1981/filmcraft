@@ -93,7 +93,9 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
     });
     let update: ShortcutUpdater = Box::new(move |items: &[Item]| {
         let checked = |id: &str| items.iter().any(|it| it.id == id && it.checked == Some(true));
-        let language = if checked("app.language.japanese") {
+        let language = if checked("app.language.traditionalChinese") {
+            filmcraft_ui_egui::i18n::Language::ZhTw
+        } else if checked("app.language.japanese") {
             filmcraft_ui_egui::i18n::Language::Ja
         } else if checked("app.language.spanish") {
             filmcraft_ui_egui::i18n::Language::Es

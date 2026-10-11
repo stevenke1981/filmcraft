@@ -36,6 +36,8 @@ fn join_error(e: tokio::task::JoinError) -> AutomationError {
 pub struct FilmcraftMcp {
     backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
+    pub(crate) workspace: Option<Arc<crate::workspace::Workspace>>,
+    pub(crate) ledger: Arc<tokio::sync::Mutex<crate::agent::Ledger>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -157,6 +159,9 @@ pub struct ControlParams {
 fn ok_json(v: &Value) -> CallToolResult {
     CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(v).unwrap_or_default())])
 }
+fn agent_result(v: Value) -> CallToolResult {
+    if v["ok"] == true { ok_json(&v) } else { CallToolResult::error(vec![Content::text(v.to_string())]) }
+}
 fn fail(e: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![Content::text(e.to_string())])
 }
@@ -172,10 +177,25 @@ fn wrap(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpError> {
 
 impl FilmcraftMcp {
     pub fn headless(session: Session) -> Self {
-        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() }
+        Self {
+            backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))),
+            tool_router: Self::tool_router(),
+            workspace: None,
+            ledger: Default::default(),
+        }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() })
+        Ok(Self {
+            backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))),
+            tool_router: Self::tool_router(),
+            workspace: None,
+            ledger: Default::default(),
+        })
+    }
+
+    pub fn with_workspace(mut self, root: &std::path::Path) -> Result<Self, AutomationError> {
+        self.workspace = Some(Arc::new(crate::workspace::Workspace::new(root).map_err(AutomationError::BadRequest)?));
+        Ok(self)
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
@@ -237,6 +257,38 @@ impl FilmcraftMcp {
 
     /// Run an engine command on whichever backend.
     pub async fn run(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+        if self.workspace.is_some()
+            && !matches!(
+                id,
+                "command.list"
+                    | "project.inspect"
+                    | "project.document"
+                    | "sequence.inspect"
+                    | "history.list"
+                    | "export.formats"
+                    | "export.presets.list"
+                    | "state.inspect"
+                    | "playhead.set"
+                    | "timeline.select"
+            )
+        {
+            return Err(AutomationError::BadRequest("unsupported in workspace mode; use the versioned *_v1 tools for edits".into()));
+        }
+        if !matches!(id, "command.list" | "export.formats" | "export.presets.list") {
+            self.ensure_scope().await?;
+        }
+        self.run_unchecked(id, params).await
+    }
+
+    async fn ensure_scope(&self) -> Result<(), AutomationError> {
+        if let Some(w) = &self.workspace {
+            let document = self.run_unchecked("project.document", json!({})).await?;
+            w.document(&document).map_err(AutomationError::BadRequest)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run_unchecked(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
         match &*self.backend {
             Backend::Headless(s) => {
                 let s = s.clone();
@@ -260,7 +312,7 @@ impl FilmcraftMcp {
         Ok(json!({"project": project, "sequence": sequence}))
     }
 
-    fn bridge_client(&self) -> Option<Arc<BridgeClient>> {
+    pub(crate) fn bridge_client(&self) -> Option<Arc<BridgeClient>> {
         match &*self.backend {
             Backend::Bridge(b) => Some(b.clone()),
             Backend::Headless(_) => None,
@@ -268,6 +320,12 @@ impl FilmcraftMcp {
     }
 
     async fn ui(&self, method: &str, params: Value) -> Result<CallToolResult, McpError> {
+        if self.workspace.is_some() && !matches!(method, "ui.inspect" | "ui.elements" | "ui.menu.list") {
+            return Ok(fail("unsupported in workspace mode; raw UI input can bypass path and confirmation checks"));
+        }
+        if let Err(e) = self.ensure_scope().await {
+            return Ok(fail(e));
+        }
         match self.bridge_client() {
             Some(b) => wrap(b.call(method, params).await),
             None => Ok(fail(
@@ -279,6 +337,96 @@ impl FilmcraftMcp {
 
 #[tool_router]
 impl FilmcraftMcp {
+    #[tool(
+        title = "App capabilities v1",
+        description = "Versioned live-App/engine capabilities, workspace scope, confirmation and retry rules. Start here.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn app_capabilities_v1(&self) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_capabilities()))
+    }
+
+    #[tool(
+        title = "Read project v1",
+        description = "Read the actual App project tree, stable ids and revision. Validates local media references against --workspace.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn project_read_v1(&self) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_read(false).await))
+    }
+
+    #[tool(
+        title = "Create, open or save project v1",
+        description = "Operate on the App's project using the common command layer. Paths stay within --workspace. Guard revision and request_id are required; confirm discard/overwrite explicitly with the user.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn project_write_v1(&self, Parameters(p): Parameters<crate::agent::ProjectWrite>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_project(p).await))
+    }
+
+    #[tool(
+        title = "Import media v1",
+        description = "Import up to 32 local files inside --workspace into the actual App project. Retry with the same request_id to avoid duplicate imports.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn media_import_v1(&self, Parameters(p): Parameters<crate::agent::ImportMedia>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_import(p).await))
+    }
+
+    #[tool(
+        title = "Read timeline v1",
+        description = "Read actual sequence tracks, clip ids, source ranges and project revision. Integer ticks: 254016000000 per second.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn timeline_read_v1(&self) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_read(true).await))
+    }
+
+    #[tool(
+        title = "Edit timeline v1",
+        description = "Create a sequence or place, move, trim, split or delete real timeline clips. Edits use App History. Overwrite placement/move and deletion require explicit user confirmation.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn timeline_edit_v1(&self, Parameters(p): Parameters<crate::agent::EditTimeline>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_edit(p).await))
+    }
+
+    #[tool(
+        title = "Undo or redo v1",
+        description = "Undo/redo through the actual App's shared History. Guard revision prevents applying to a changed project; request_id prevents duplicate undo.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn history_v1(&self, Parameters(p): Parameters<crate::agent::History>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_history(p).await))
+    }
+
+    #[tool(
+        title = "Start export v1",
+        description = "Start the App's H.264/AAC MP4 export job inside --workspace. Returns job id immediately; inspect status or cancel separately. Confirm overwriting existing output with the user.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn export_start_v1(&self, Parameters(p): Parameters<crate::agent::StartExport>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_export(p).await))
+    }
+
+    #[tool(
+        title = "Export status v1",
+        description = "Read a real App job started by this MCP process, including progress, ETA, result and failure.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn export_status_v1(&self, Parameters(p): Parameters<crate::agent::Job>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_job(p.job).await))
+    }
+
+    #[tool(
+        title = "Cancel export v1",
+        description = "Cancel only an export started by this MCP process. Deletes generated partial output; obtain explicit user confirmation and set guard.confirm=true.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn export_cancel_v1(&self, Parameters(p): Parameters<crate::agent::CancelExport>) -> Result<CallToolResult, McpError> {
+        Ok(agent_result(self.agent_cancel(p).await))
+    }
+
     #[tool(
         title = "List commands",
         description = "List every command (id, label, menu path, shortcut, parameter doc, enabled now). Menus, shortcuts, panels and timeline gestures all map to these ids.",
@@ -319,6 +467,9 @@ impl FilmcraftMcp {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn command_batch(&self, Parameters(p): Parameters<BatchParams>) -> Result<CallToolResult, McpError> {
+        if p.steps.len() > 64 {
+            return Ok(fail("a command batch is limited to 64 steps"));
+        }
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
         for st in p.steps {
@@ -393,6 +544,12 @@ impl FilmcraftMcp {
     )]
     async fn render_frame(&self, Parameters(p): Parameters<RenderParams>) -> Result<CallToolResult, McpError> {
         let max = p.max_side.unwrap_or(960);
+        if !(16..=3840).contains(&max) || p.seconds.is_some_and(|v| !v.is_finite() || !(0.0..=86_400.0).contains(&v)) {
+            return Ok(fail("preview needs max_side 16..3840 and finite seconds 0..86400"));
+        }
+        if let Err(e) = self.ensure_scope().await {
+            return Ok(fail(e));
+        }
         match &*self.backend {
             Backend::Headless(s) => {
                 let s = s.clone();
@@ -528,7 +685,22 @@ impl FilmcraftMcp {
 
 impl FilmcraftMcp {
     async fn screenshot(&self, b: &BridgeClient, panel: Option<String>, max: u32) -> Result<CallToolResult, McpError> {
-        let path = std::env::temp_dir().join(format!("filmcraft-mcp-{}.png", std::process::id()));
+        if !(16..=3840).contains(&max) {
+            return Ok(fail("screenshot max_side must be 16..3840"));
+        }
+        if let Err(e) = self.ensure_scope().await {
+            return Ok(fail(e));
+        }
+        static SHOT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = SHOT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("filmcraft-mcp-{}-{id}.png", std::process::id());
+        let path = match &self.workspace {
+            Some(w) => match w.path(&name, false) {
+                Ok(p) => p,
+                Err(e) => return Ok(fail(e)),
+            },
+            None => std::env::temp_dir().join(name),
+        };
         if let Err(e) = b.call("ui.screenshot", json!({"path": path.to_string_lossy(), "panel": panel})).await {
             return Ok(fail(e));
         }
@@ -561,7 +733,7 @@ impl FilmcraftMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). Every edit is an engine command: `command_list` to discover ids/params, `command_run` to execute (undoable; `command_batch` runs several). `doc_inspect` (or `project_inspect`/`sequence_inspect`) returns ids you can pass to commands; `render_preview` shows the result. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it. Time is in ticks: 254016000000 per second (commands also accept `seconds`, `frame` or `timecode`).";
+const INSTRUCTIONS: &str = "FilmCraft video editor. Start with app_capabilities_v1: live_app uses the desktop App's shared command layer; headless_engine is a separate engine session. CLI MCP requires --workspace. Use project_read_v1/timeline_read_v1 to get stable ids and revision, then *_v1 mutations with guard.request_id and guard.revision. Repeat identical arguments and request_id after an uncertain response; never invent a new id to retry a possibly delivered edit. Idempotency lasts for this server process (1024 requests). Obtain explicit user confirmation before setting guard.confirm for overwrite, deletion, discard or cancellation. Paths and project media references must remain inside the workspace. Network publishing, arbitrary raw command mutations and raw UI input are unsupported in scoped MCP. ui_inspect/ui_elements/ui_screenshot and render_preview inspect the actual live App in bridge mode. Integer time: 254016000000 ticks per second.";
 
 /// Resources: the project (as `doc_inspect`) and the command catalog (as `command_list`).
 const DOCUMENT_URI: &str = "filmcraft://document";
@@ -591,6 +763,8 @@ impl ServerHandler for FilmcraftMcp {
         if let Some(m) = self.unknown_arg(&request.name, request.arguments.as_ref()) {
             return Err(McpError::invalid_params(m, None));
         }
+        crate::agent::validate_arguments(&request.name, request.arguments.clone().map(Value::Object).unwrap_or_else(|| json!({})))
+            .map_err(|e| McpError::invalid_params(e, None))?;
         // A blocking export reports progress and can be cancelled (docs/agents.md § Long exports).
         // Bridge mode too: the app runs it as a job, so it stays responsive (#91, #92).
         if request.name == "command_run"
@@ -789,7 +963,7 @@ mod tests {
         let mut c = Client::start(demo());
         let init = c.init().await;
         assert!(init["result"]["capabilities"]["resources"].is_object(), "{init}");
-        assert!(init["result"]["instructions"].as_str().unwrap().contains("doc_inspect"), "{init}");
+        assert!(init["result"]["instructions"].as_str().unwrap().contains("app_capabilities_v1"), "{init}");
         let r = c.ask(json!({"jsonrpc":"2.0","id":1,"method":"resources/list"})).await;
         let uris: Vec<&str> = r["result"]["resources"].as_array().unwrap().iter().filter_map(|x| x["uri"].as_str()).collect();
         assert_eq!(uris, [DOCUMENT_URI, COMMANDS_URI], "{r}");

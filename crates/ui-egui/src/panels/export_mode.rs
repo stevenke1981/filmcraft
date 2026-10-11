@@ -300,7 +300,7 @@ const LABEL_W: f32 = 132.0;
 /// A labelled settings row.
 fn row<R>(ui: &mut egui::Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(LABEL_W, 20.0), egui::Label::new(egui::RichText::new(label).color(t.text_dim).size(12.0)).truncate());
+        ui.add_sized(vec2(LABEL_W, 20.0), egui::Label::new(egui::RichText::new(crate::i18n::t(label)).color(t.text_dim).size(12.0)).truncate());
         add(ui)
     })
     .inner
@@ -348,7 +348,7 @@ fn drag(ui: &mut egui::Ui, reg: &mut Reg, id: &str, v: &mut f64, range: std::ops
 }
 
 fn check(ui: &mut egui::Ui, reg: &mut Reg, id: &str, v: &mut bool, label: &str) -> bool {
-    let r = ui.checkbox(v, label);
+    let r = ui.checkbox(v, crate::i18n::t(label));
     reg.add(id, r.rect, label);
     r.changed()
 }
@@ -963,9 +963,9 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
                     ui.end_row();
                 };
                 line(ui, "Output", &output_path(ex));
-                line(ui, "", &sum.format);
-                line(ui, "", &sum.video);
-                line(ui, "", &sum.audio);
+                line(ui, "", &localized_summary(&sum.format));
+                line(ui, "", &localized_summary(&sum.video));
+                line(ui, "", &localized_summary(&sum.audio));
                 line(
                     ui,
                     "Source",
@@ -989,7 +989,7 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
             });
         })
         .response;
-    reg.add("export.summary", resp.rect, sum.video.clone());
+    reg.add("export.summary", resp.rect, localized_summary(&sum.video));
     child.add_space(4.0);
     let est = child.label(egui::RichText::new(tlf!("Estimated file size: {size}", size = format_bytes(sum.estimated_bytes))).color(t.text_dim));
     reg.add("export.estimate", est.rect, sum.estimated_size.clone());
@@ -1023,6 +1023,37 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
             Err(e) => app.ui.status = e.to_string(),
         }
     }
+}
+
+/// Translate only generated setting descriptions; output paths and codec identifiers stay intact.
+fn localized_summary(text: &str) -> String {
+    let mut result = text.to_string();
+    for label in [
+        "No video",
+        "No audio",
+        "Progressive",
+        "Upper First",
+        "Lower First",
+        "auto level",
+        "VBR, 1 pass",
+        "VBR, 2 pass",
+        "Target",
+        "Max",
+        "keyframe every",
+        "frames",
+        "quality",
+        "Stereo",
+        "Mono",
+        "Uncompressed",
+        "hardware encoder",
+        "Image sequence",
+    ] {
+        let translated = crate::i18n::t(label);
+        if translated != label {
+            result = result.replace(label, translated);
+        }
+    }
+    result
 }
 
 /// The export range in sequence ticks (for the summary).

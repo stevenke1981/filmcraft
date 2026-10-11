@@ -13,6 +13,36 @@ fn invalid_preview_scales_are_rejected_without_allocating() {
 }
 use serde_json::json;
 
+#[test]
+fn agent_revision_guard_dispatches_once_into_normal_history() {
+    let mut s = Session::default();
+    let rev = s.revision;
+    s.execute("agent.execute", json!({"revision":rev,"command":"file.newSequence","params":{"name":"Agent","width":320,"height":180,"fps":24}})).unwrap();
+    assert_eq!(s.journal.len(), 1);
+    assert_eq!(s.journal[0].0, "file.newSequence");
+    assert_eq!(s.history.undo.len(), 1);
+    let sequence = s.state.active_sequence.unwrap();
+    let revision = s.revision;
+    assert!(s.execute("agent.execute", json!({"revision":rev,"command":"file.newSequence","params":{}})).is_err());
+    for params in [
+        json!({}),
+        json!({"revision":-1,"command":"file.newSequence","params":{}}),
+        json!({"revision":revision,"command":"agent.execute","params":{}}),
+        json!({"revision":revision,"command":"file.newSequence","params":[]}),
+    ] {
+        assert!(s.execute("agent.execute", params).is_err());
+    }
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.undo.len(), 1);
+    assert_eq!(s.journal.len(), 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.active_sequence().is_none());
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.project.item(sequence).unwrap().name, "Agent");
+    s.execute("agent.execute", json!({"revision":s.revision,"command":"sequence.open","params":{"item":sequence.0}})).unwrap();
+    assert_eq!(s.state.active_sequence, Some(sequence));
+}
+
 fn demo() -> Session {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();

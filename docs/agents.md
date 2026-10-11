@@ -7,33 +7,42 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 
 ## 1. MCP server
 
-`filmcraft-cli mcp` serves MCP on stdio. It has two modes:
+`filmcraft-cli mcp --workspace /abs/allowed-media` serves scoped MCP on stdio. The
+[trilingual integration guide](agent-integration.md) documents the ten versioned tools,
+revision/request-id guards, workspace paths, confirmation and a complete editing/export example.
+It has two modes:
 
 | Mode | Command | What it drives |
 |---|---|---|
-| Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
-| Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
+| Headless | `filmcraft-cli mcp --workspace /abs/allowed-media` | a separate in-process engine session, no window |
+| Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876 --workspace /abs/allowed-media` | the actual desktop App started with `filmcraft --control 9876` |
 
-**Claude Code.** The repository's `.mcp.json` registers both servers (`filmcraft` = bridge,
-`filmcraft-headless` = demo). Both point at `target/release/filmcraft-cli`, so build it first:
+**Client configuration.** Build the binaries first, then apply the client configuration
+yourself. The old repository `.mcp.json` needs an explicit absolute `--workspace` argument
+before use; this change does not install or modify persistent agent configuration.
 
 ```sh
 cargo build --release -p filmcraft-cli -p filmcraft
 ./target/release/filmcraft --control 9876 &      # only for the bridge server
-claude                                           # approve the project MCP servers when asked
 ```
 
 To register the server by hand, or for another MCP client, use the absolute binary path:
 
 ```sh
-claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraft-cli mcp --demo
+filmcraft-cli mcp --workspace /abs/allowed-media
 ```
 
 ```json
-{ "mcpServers": { "filmcraft": { "command": "/abs/path/filmcraft-cli", "args": ["mcp", "--bridge", "127.0.0.1:9876"] } } }
+{ "mcpServers": { "filmcraft": { "command": "/abs/path/filmcraft-cli", "args": ["mcp", "--bridge", "127.0.0.1:9876", "--workspace", "/abs/allowed-media"] } } }
 ```
 
 ### Tools
+
+Use the `*_v1` tools in the integration guide for mutations. The legacy discovery/read
+tools below remain available, but raw command mutations, legacy media import and raw UI
+input return explicit unsupported errors in scoped MCP. `ui_control` is limited to UI
+inspection, elements and menu listing. Open projects through `project_write_v1`; MCP rejects
+`--project` startup so references are checked before loading.
 
 | Tool | Modes | Purpose |
 |---|---|---|
@@ -55,8 +64,8 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 | `ui_screenshot` | bridge | PNG of the window or one `panel` |
 | `ui_control` | bridge | call any control-channel method directly (`ui.set`, `ui.scroll`, `ui.timeline.locate`, …) |
 
-Typical loop: `project_inspect` / `sequence_inspect` → get ids → `command_run` → `render_frame` or
-`ui_screenshot` → look at the result → `edit.undo` if it's wrong.
+Typical loop: `project_read_v1` / `timeline_read_v1` → get ids and revision → versioned
+mutation → `render_frame` or `ui_screenshot` → inspect → `history_v1` to undo if needed.
 
 ### Conventions
 
@@ -82,6 +91,11 @@ driven one app can drive the others.
   `cacheScope` hints that revision requires.
 
 ### Long exports: progress and cancellation
+
+Scoped MCP uses `export_start_v1`, `export_status_v1` and `export_cancel_v1`. An owned
+H.264/AAC job returns immediately; cancellation requires confirmation and removes its
+partial MP4 before the job reports completion. The legacy blocking API described below
+remains for trusted internal/unscoped library use and ordinary CLI commands.
 
 `command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
 the file is written. It uses the MCP progress and cancellation utilities, so a client can show

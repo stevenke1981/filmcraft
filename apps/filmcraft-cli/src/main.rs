@@ -101,6 +101,7 @@ OPTIONS
   --save                        save the project back to --project when done
   --save-as <p.fcproj>          save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
+  --workspace <absolute dir>   required for MCP: local paths and versioned safe agent tools
   --data-dir <dir>              FilmCraft data directory for user export presets (headless;
                                 default: the app's data directory)
   --keep-going                  `run`: report failing lines and continue
@@ -421,6 +422,12 @@ async fn cli() {
             eprintln!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0);
         }
         "mcp" => {
+            let workspace = a
+                .opt("--workspace")
+                .unwrap_or_else(|| usage("mcp requires --workspace <existing absolute directory>; this does not change agent configuration"));
+            if a.opt("--project").is_some() {
+                usage("mcp: open projects with project_write_v1 so their media references are checked before loading");
+            }
             let server = match a.opt("--bridge") {
                 Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| fail(e)),
                 None => match Backend::open(&a) {
@@ -428,6 +435,7 @@ async fn cli() {
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
                 },
             };
+            let server = server.with_workspace(std::path::Path::new(workspace)).unwrap_or_else(|e| fail(e));
             if let Err(e) = server.serve_stdio().await {
                 fail(format!("mcp: {e}"));
             }

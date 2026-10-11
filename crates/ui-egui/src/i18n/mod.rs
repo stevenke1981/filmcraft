@@ -29,6 +29,8 @@ use catalog::Catalog;
 pub enum Language {
     #[default]
     En,
+    #[serde(rename = "zh-TW")]
+    ZhTw,
     Ja,
     Es,
     /// Persisted as `pt-br` (the blanket `rename_all` would produce `ptbr`).
@@ -37,15 +39,17 @@ pub enum Language {
 }
 
 static JAPANESE: OnceLock<Catalog> = OnceLock::new();
+static TRADITIONAL_CHINESE: OnceLock<Catalog> = OnceLock::new();
 static SPANISH: OnceLock<Catalog> = OnceLock::new();
 static PORTUGUESE: OnceLock<Catalog> = OnceLock::new();
 
 impl Language {
-    pub const ALL: [Self; 4] = [Self::En, Self::Ja, Self::Es, Self::PtBr];
+    pub const ALL: [Self; 5] = [Self::En, Self::ZhTw, Self::Ja, Self::Es, Self::PtBr];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::En => "English",
+            Self::ZhTw => "繁體中文",
             Self::Ja => "日本語",
             Self::Es => "Español",
             Self::PtBr => "Português (Brasil)",
@@ -55,6 +59,7 @@ impl Language {
     pub fn parse(code: &str) -> Option<Self> {
         match code {
             "en" => Some(Self::En),
+            "zh-TW" | "zh-tw" | "zh-Hant" => Some(Self::ZhTw),
             "ja" => Some(Self::Ja),
             "es" => Some(Self::Es),
             "pt-br" => Some(Self::PtBr),
@@ -69,6 +74,13 @@ impl Language {
         const PRIMARY: [(&str, Language); 4] = [("en", Language::En), ("ja", Language::Ja), ("es", Language::Es), ("pt", Language::PtBr)];
         tags.iter()
             .find_map(|tag| {
+                let normalized = tag.split(['.', '@']).next().unwrap_or_default().replace('_', "-").to_ascii_lowercase();
+                if normalized.split('-').next() == Some("zh")
+                    && normalized.split('-').any(|part| matches!(part, "tw" | "hk" | "mo" | "hant"))
+                    && !normalized.split('-').any(|part| part == "hans")
+                {
+                    return Some(Self::ZhTw);
+                }
                 let primary = tag.split(['-', '_', '.', '@']).next().unwrap_or_default();
                 PRIMARY.iter().find(|(code, _)| primary.eq_ignore_ascii_case(code)).map(|(_, l)| *l)
             })
@@ -79,6 +91,7 @@ impl Language {
     pub fn code(self) -> &'static str {
         match self {
             Self::En => "en",
+            Self::ZhTw => "zh-TW",
             Self::Ja => "ja",
             Self::Es => "es",
             Self::PtBr => "pt-br",
@@ -89,6 +102,7 @@ impl Language {
     fn catalog(self) -> Option<&'static Catalog> {
         match self {
             Self::En => None,
+            Self::ZhTw => Some(TRADITIONAL_CHINESE.get_or_init(|| Catalog::parse(include_str!("zh-TW.tsv")))),
             Self::Ja => Some(JAPANESE.get_or_init(|| Catalog::parse(include_str!("ja.tsv")))),
             Self::Es => Some(SPANISH.get_or_init(|| Catalog::parse(include_str!("es.tsv")))),
             Self::PtBr => Some(PORTUGUESE.get_or_init(|| Catalog::parse(include_str!("pt-br.tsv")))),
@@ -126,6 +140,25 @@ pub fn current() -> Language {
 /// Translate an English UI string into the current language (the `tl!` macro, for literals).
 pub fn t(text: &str) -> &str {
     current().tr(text)
+}
+
+/// Localise engine error categories for display, retaining the diagnostic verbatim for support.
+/// Project content, filenames and protocol errors remain unchanged.
+pub fn display_message(text: &str) -> String {
+    let translated = t(text);
+    if translated != text {
+        return translated.to_string();
+    }
+    let template = if text.starts_with("invalid parameters") {
+        Some("Invalid parameters: {detail}")
+    } else if text.contains("not available right now") || text.contains("is disabled") {
+        Some("Command unavailable: {detail}")
+    } else if text.starts_with("unknown command") || text.starts_with("internal error") {
+        Some("Command failed: {detail}")
+    } else {
+        None
+    };
+    template.map_or_else(|| text.to_string(), |s| fmt(t(s), &[("detail", text)]))
 }
 
 /// Match a lowercased search query against both the source and the displayed label.
@@ -245,8 +278,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traditional_chinese_and_japanese_cover_the_main_editing_surfaces() {
+        let files = [
+            include_str!("../header.rs"),
+            include_str!("../panels/project.rs"),
+            include_str!("../panels/media_browser.rs"),
+            include_str!("../panels/timeline.rs"),
+            include_str!("../panels/export_mode.rs"),
+            include_str!("../panels/monitor.rs"),
+            include_str!("../panels/effect_controls.rs"),
+        ];
+        for lang in [Language::ZhTw, Language::Ja] {
+            for file in files {
+                for literal in tl_literals(file.split("#[cfg(test)]").next().unwrap_or(file)) {
+                    assert!(lang.has(&literal), "{}: missing {literal:?}", lang.code());
+                }
+            }
+            for text in
+                ["File", "Edit", "Sequence", "Markers", "Clip", "Window", "Help", "Undo", "Redo", "Save", "Open Project…", "Export", "Interface Language"]
+            {
+                assert!(lang.has(text), "{}: missing {text}", lang.code());
+            }
+            // The fixed video/audio controls appear on every newly placed clip. Their labels
+            // come from the project registry, so a literal-only scan cannot find them.
+            for effect in filmcraft_project::effect_defs().iter().filter(|effect| effect.intrinsic) {
+                assert!(lang.has(effect.name), "{}: missing {}", lang.code(), effect.name);
+                for param in &effect.params {
+                    assert!(lang.has(param.label), "{}: missing {}", lang.code(), param.label);
+                    if let filmcraft_project::ParamKind::Choice(options) = param.kind {
+                        for option in options {
+                            assert!(lang.has(option), "{}: missing {option}", lang.code());
+                        }
+                    }
+                }
+            }
+            assert_eq!(lang.tr("素材 {n}.mp4"), "素材 {n}.mp4");
+        }
+        assert_eq!(Language::from_locales(&["zh_TW.UTF-8".into()]), Language::ZhTw);
+        assert_eq!(Language::from_locales(&["zh-Hant-HK".into()]), Language::ZhTw);
+        assert_eq!(Language::from_locales(&["zh-Hans-CN".into(), "ja-JP".into()]), Language::Ja);
+        assert_eq!(Language::ZhTw.tr("File"), "檔案");
+        assert_eq!(Language::Ja.tr("File Name"), "ファイル名");
+        set_current(Language::ZhTw);
+        assert!(display_message("invalid parameters for timeline.trim: bad id").starts_with("參數無效"));
+        assert_eq!(fmt(t("Project: {name}"), &[("name", "私の影片 {name}.fcproj")]), "專案：私の影片 {name}.fcproj");
+        set_current(Language::En);
+    }
+
+    #[test]
+    fn traditional_chinese_preferences_and_menu_ids_roundtrip() {
+        if !crate::cjk::available() {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut app = crate::FilmcraftApp::new(filmcraft_engine::Session::default());
+        crate::menus::invoke(&mut app, &ctx, "app.language.traditionalChinese", serde_json::json!({})).unwrap();
+        assert_eq!(app.ui.language, Language::ZhTw);
+        assert_eq!(app.session.prefs.general.interface_language, "zh-TW");
+        let prefs = app.session.prefs.to_value();
+        let mut session = filmcraft_engine::Session::default();
+        session.prefs = serde_json::from_value(prefs).unwrap();
+        let restored = crate::FilmcraftApp::new(session);
+        assert_eq!(restored.ui.language, Language::ZhTw);
+        assert!(crate::menus::menu_items(&restored).iter().any(|m| m.id == "app.language.traditionalChinese" && m.checked == Some(true)));
+        set_current(Language::En);
+    }
+
+    #[test]
     fn catalogs_are_well_formed() {
-        for (code, text) in [("es", include_str!("es.tsv")), ("ja", include_str!("ja.tsv")), ("pt-br", include_str!("pt-br.tsv"))] {
+        for (code, text) in
+            [("es", include_str!("es.tsv")), ("ja", include_str!("ja.tsv")), ("zh-TW", include_str!("zh-TW.tsv")), ("pt-br", include_str!("pt-br.tsv"))]
+        {
             let (entries, errors) = catalog::parse_entries(text);
             assert!(errors.is_empty(), "{code}: {errors:?}");
             for (i, (ctx, en, tr)) in entries.iter().enumerate() {

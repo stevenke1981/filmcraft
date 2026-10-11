@@ -271,8 +271,13 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
     // Japanese before Chinese: the two share code points, and Japanese text must keep Japanese
     // glyph forms; Chinese faces still cover the hanzi Japanese fonts lack
-    add_craft_fonts(&mut fonts);
-    crate::cjk::install(&mut fonts);
+    if crate::i18n::current() == crate::i18n::Language::ZhTw {
+        crate::cjk::install(&mut fonts, true);
+        add_craft_fonts(&mut fonts);
+    } else {
+        add_craft_fonts(&mut fonts);
+        crate::cjk::install(&mut fonts, false);
+    }
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
 }

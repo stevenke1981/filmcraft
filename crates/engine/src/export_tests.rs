@@ -392,6 +392,33 @@ fn queue_cancels_a_running_export_and_retries_a_failed_one() {
 }
 
 #[test]
+fn scoped_mp4_cancel_removes_the_generated_partial_output() {
+    let mut s = demo();
+    let dir = Scratch::new("scoped-cancel");
+    let output = dir.path("partial.mp4");
+    let start = s
+        .execute(
+            "file.exportMedia",
+            json!({"path":output,"format":"h264","width":320,"height":180,"fps":24,"hardwareEncoding":"off","removeCancelledOutput":true}),
+        )
+        .unwrap();
+    let job = start["job"].as_u64().unwrap();
+    s.execute("jobs.cancel", json!({"job":job})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let state = s.jobs.iter().find(|j| j.id == job).unwrap().to_json();
+        if state["finished"] == true && !state["result"].is_null() {
+            assert_eq!(state["result"]["error"], "cancelled");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "cancelled exporter did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!Path::new(&output).exists());
+    assert!(s.execute("file.exportMedia", json!({"path":dir.path("bad.wav"),"format":"wav","removeCancelledOutput":true})).is_err());
+}
+
+#[test]
 fn jobs_and_queue_items_report_the_time_they_have_left() {
     use std::sync::atomic::Ordering;
     use std::time::Duration;

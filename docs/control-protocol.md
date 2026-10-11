@@ -138,11 +138,16 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 `shortcuts.*` (`shortcuts.key.K`, `shortcuts.cell.<command>`, `shortcuts.ok`, …).
 
 ## MCP
-`filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
-or `--bridge 127.0.0.1:9876` to drive the running app. Tools: `command_list`, `command_run`,
+`filmcraft-cli mcp --workspace /abs/allowed-media` serves MCP on stdio: headless (a separate
+engine session), or add `--bridge 127.0.0.1:9876` to drive the running App. See the
+[trilingual versioned integration guide](agent-integration.md) for the ten v1 tools,
+workspace guards, confirmation and editing/export examples. Legacy tools: `command_list`, `command_run`,
 `command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`, `media_import`,
 `render_frame`, `ui_inspect`, `ui_elements`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_screenshot`,
-`ui_control`; resources `filmcraft://document` and `filmcraft://commands`. `.mcp.json` registers both.
+`ui_control`; resources `filmcraft://document` and `filmcraft://commands`. In scoped MCP,
+raw command mutations, legacy media import and raw UI input are explicitly unsupported;
+UI inspection/element/menu listing and screenshots remain available. The legacy `.mcp.json`
+example needs an explicit absolute workspace before use; no configuration is installed automatically.
 Annotations, argument checking, errors and export progress / cancellation:
 [agents.md § Conventions](agents.md#conventions).
 

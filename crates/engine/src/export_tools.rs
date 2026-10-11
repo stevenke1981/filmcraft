@@ -381,7 +381,19 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
 }
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
-pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+    spawn_export_with_cleanup(s, project, seq, settings, label, wait, false)
+}
+
+fn spawn_export_with_cleanup(
+    s: &mut Session,
+    project: Arc<Project>,
+    seq: ItemId,
+    mut settings: ExportSettings,
+    label: String,
+    wait: bool,
+    cleanup: bool,
+) -> Result<u64> {
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
@@ -408,7 +420,16 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         return Ok(id);
     }
     let run = move || {
-        let r = filmcraft_export::export(&project, seq, &settings, &provider, &prog).map_err(|e| e.to_string());
+        let mut r = filmcraft_export::export(&project, seq, &settings, &provider, &prog).map_err(|e| e.to_string());
+        // Scoped agent MP4 jobs opt in: publish completion only after their partial file is removed.
+        if cleanup
+            && r.as_ref().is_err_and(|e| e == "cancelled")
+            && settings.sink.is_none()
+            && let Err(e) = std::fs::remove_file(&settings.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            r = Err(format!("cancelled; could not remove partial output: {e}"));
+        }
         if let Err(e) = &r {
             *prog.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
             prog.finished.store(true, Ordering::Relaxed);
@@ -460,7 +481,11 @@ pub fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
     settings.path = output_path(s, p, seq, &settings, None);
     let wait = bool_p(p, "wait").unwrap_or(false);
     let path = settings.path.clone();
-    let id = spawn_export(s, project, seq, settings, format!("Export {}", file_name(&path)), wait)?;
+    let cleanup = bool_p(p, "removeCancelledOutput").unwrap_or(false);
+    if cleanup && settings.format != Format::H264 {
+        return Err(bad(cmd, "removeCancelledOutput is supported only for H.264 MP4"));
+    }
+    let id = spawn_export_with_cleanup(s, project, seq, settings, format!("Export {}", file_name(&path)), wait, cleanup)?;
     let mut out = json!({"job": id, "path": path});
     if let Some(pr) = preset {
         out["preset"] = json!(pr.name);

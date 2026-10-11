@@ -3480,3 +3480,17 @@
 	New Sequence	Nueva secuencia
 	Tracks	Pistas
 	tracks	pistas
+
+	繁體中文	繁體中文
+	A clean-room, pure-Rust non-linear video editor. Based on FilmCraft.	Un editor de vídeo no lineal independiente, escrito en Rust. Basado en FilmCraft.
+	No video	Sin vídeo
+	No audio	Sin audio
+	auto level	nivel automático
+	Target	Objetivo
+	Max	Máximo
+	keyframe every	fotograma clave cada
+	quality	calidad
+	Uncompressed	Sin comprimir
+	hardware encoder	codificador de hardware
+	Image sequence	Secuencia de imágenes
+	Menus	Menús

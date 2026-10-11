@@ -1,0 +1,86 @@
+name: Agent and language regression
+
+on:
+  push:
+    branches: [main, 'feat/i18n-zh-tw-ja-mcp-v1']
+    paths:
+      - 'crates/**'
+      - 'apps/**'
+      - 'scripts/verify-mcp-app.cjs'
+      - 'scripts/capture-i18n-app.cjs'
+      - '.github/workflows/agent-i18n.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'apps/**'
+      - 'scripts/verify-mcp-app.cjs'
+      - 'scripts/capture-i18n-app.cjs'
+      - '.github/workflows/agent-i18n.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-i18n-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 1
+      RUST_TEST_THREADS: 1
+      RAYON_NUM_THREADS: 1
+      FILMCRAFT_REQUIRE_ORACLES: 1
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_TEST_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: agent-i18n-windows
+      - name: Verify portable external test oracles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'filmcraft-oracles-9.0.2'
+          New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+          $archive = Join-Path $toolRoot 'ffmpeg-9.0.2-full_build.zip'
+          Invoke-WebRequest -Uri 'https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.zip' -OutFile $archive
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '759d0a9831c436a0eb331ad36f236c06cb04aaa0005da46571f0e9d3d9206f6b') { throw 'FFmpeg archive SHA-256 mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $toolRoot
+          $bin = Join-Path $toolRoot 'ffmpeg-9.0.2-full_build/bin'
+          $ffmpeg = Join-Path $bin 'ffmpeg.exe'
+          $ffprobe = Join-Path $bin 'ffprobe.exe'
+          & $ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg verification failed' }
+          $decoders = & $ffmpeg -hide_banner -decoders 2>&1
+          if ($LASTEXITCODE -ne 0 -or -not ($decoders -match '\blibdav1d\b')) { throw 'libdav1d decoder missing' }
+          $encoders = & $ffmpeg -hide_banner -encoders 2>&1
+          if ($LASTEXITCODE -ne 0 -or -not ($encoders -match '\blibsvtav1\b')) { throw 'libsvtav1 encoder missing' }
+          & $ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw 'FFprobe verification failed' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FILMCRAFT_FFMPEG=$ffmpeg" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FILMCRAFT_FFPROBE=$ffprobe" -Encoding utf8
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -j1 -- -D warnings
+      - run: cargo test --workspace --locked -j1 -- --test-threads=1
+      - run: cargo xtask layers
+      - run: cargo xtask assets
+      - run: cargo xtask wasm
+      - run: node --check scripts/verify-mcp-app.cjs
+      - run: node --check scripts/capture-i18n-app.cjs

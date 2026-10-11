@@ -23,6 +23,7 @@ macro_rules! uic {
 
 pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.language.english", "English", ["Edit", "Language"], None),
+    uic!("app.language.traditionalChinese", "繁體中文", ["Edit", "Language"], None),
     uic!("app.language.japanese", "日本語", ["Edit", "Language"], None),
     uic!("app.language.spanish", "Español", ["Edit", "Language"], None),
     uic!("app.language.portuguese", "Português (Brasil)", ["Edit", "Language"], None),
@@ -168,12 +169,16 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
         let object = params.as_object_mut().ok_or("command parameters must be an object")?;
         object.insert("target".into(), json!("source"));
     }
-    if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
+    if matches!(id, "app.language.english" | "app.language.traditionalChinese" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
+        if id == "app.language.traditionalChinese" && !crate::cjk::available() {
+            return Err(crate::i18n::t("No Traditional Chinese font is installed; the interface stays in English").into());
+        }
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {
             return Err("no Japanese font is installed on this system (for example Noto Sans CJK JP); the interface stays in English".into());
         }
         let language = match id {
+            "app.language.traditionalChinese" => crate::i18n::Language::ZhTw,
             "app.language.japanese" => crate::i18n::Language::Ja,
             "app.language.spanish" => crate::i18n::Language::Es,
             "app.language.portuguese" => crate::i18n::Language::PtBr,
@@ -184,6 +189,10 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
         let saved = app.session.execute("prefs.set", json!({"key": "general.interfaceLanguage", "value": language.code()}));
         app.ui.language = language;
         crate::i18n::set_current(language);
+        crate::theme::install(ctx, &app.tokens);
+        if language == crate::i18n::Language::Ja {
+            crate::i18n::install_japanese_font(ctx);
+        }
         if let Err(e) = saved {
             app.ui.status = tlf!("The language changed but could not be saved: {e}", e);
         }
@@ -540,6 +549,7 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
         it.label = app.ui.language.tr(&it.label).to_string();
         match it.id.as_str() {
             "app.language.english" => it.checked = Some(app.ui.language == crate::i18n::Language::En),
+            "app.language.traditionalChinese" => it.checked = Some(app.ui.language == crate::i18n::Language::ZhTw),
             "app.language.japanese" => it.checked = Some(app.ui.language == crate::i18n::Language::Ja),
             "app.language.spanish" => it.checked = Some(app.ui.language == crate::i18n::Language::Es),
             "app.language.portuguese" => it.checked = Some(app.ui.language == crate::i18n::Language::PtBr),
@@ -692,16 +702,29 @@ pub fn menu_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     let items = menu_items(app);
     let ctx = ui.ctx().clone();
     let mut clicked: Option<String> = None;
+    let language = app.ui.language;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let required: f32 =
+        MENUS.iter().map(|top| ui.painter().layout_no_wrap(language.tr(top).to_string(), font.clone(), ui.visuals().text_color()).size().x + 20.0).sum();
+    let compact = required > ui.available_width();
     egui::MenuBar::new().config(egui::containers::menu::MenuConfig::new().style(crate::theme::menu_style)).ui(ui, |ui| {
-        for top in MENUS {
-            let mine: Vec<&MenuItem> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(top)).collect();
-            ui.menu_button(app.ui.language.tr(top), |ui| {
-                ui.set_min_width(260.0);
-                if mine.is_empty() {
-                    ui.add_enabled(false, egui::Button::new(tl!("(empty)")));
-                }
-                menu_level(ui, &mine, 1, &mut clicked);
-            });
+        let mut draw = |ui: &mut egui::Ui| {
+            for top in MENUS {
+                let mine: Vec<&MenuItem> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(top)).collect();
+                ui.menu_button(language.tr(top), |ui| {
+                    ui.set_min_width(260.0);
+                    if mine.is_empty() {
+                        ui.add_enabled(false, egui::Button::new(tl!("(empty)")));
+                    }
+                    menu_level(ui, &mine, 1, &mut clicked);
+                });
+            }
+        };
+        if compact {
+            let response = ui.menu_button(tl!("Menus"), draw);
+            app.auto.add("header.menus", response.response.rect, tl!("Menus"));
+        } else {
+            draw(ui);
         }
     });
     if let Some(id) = clicked {

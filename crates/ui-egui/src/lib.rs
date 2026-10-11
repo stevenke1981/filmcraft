@@ -531,13 +531,20 @@ impl FilmcraftApp {
                 }
                 None => i18n::Language::default(),
             };
-            if language == i18n::Language::Ja && !i18n::install_japanese_font(ctx) {
+            if language == i18n::Language::ZhTw && !cjk::available() {
+                self.ui.language = i18n::Language::En;
+                self.ui.status = i18n::t("No Traditional Chinese font is installed; the interface stays in English").into();
+            } else if language == i18n::Language::Ja && !i18n::install_japanese_font(ctx) {
                 self.ui.language = i18n::Language::En;
                 self.ui.status = tl!("no Japanese font is installed on this system; the interface stays in English").into();
             } else {
                 self.ui.language = language;
             }
             i18n::set_current(self.ui.language);
+            theme::install(ctx, &self.tokens);
+            if self.ui.language == i18n::Language::Ja {
+                i18n::install_japanese_font(ctx);
+            }
             let items = menus::menu_items(self);
             if let Some(hook) = self.hooks.shortcuts_changed.as_mut() {
                 hook(&items);
@@ -1386,7 +1393,7 @@ impl FilmcraftApp {
             }
         }
         let hint = if !self.ui.status.is_empty() { self.ui.status.clone() } else { self.hint_text() };
-        ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, hint, Tokens::ui(11.0), t.text_dim);
+        ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, i18n::display_message(&hint), Tokens::ui(11.0), t.text_dim);
         let resp = ui.interact(sb, egui::Id::new("status-bar"), egui::Sense::click());
         if resp.clicked() {
             self.ui.status.clear();
