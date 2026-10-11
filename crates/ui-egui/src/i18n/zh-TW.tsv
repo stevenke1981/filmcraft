@@ -884,3 +884,10 @@
 	Channel Volume	聲道音量
 	Panner	聲像控制
 	Balance	平衡
+	Replace Export File?	取代匯出檔案？
+	This file already exists. Replace it after the export completes successfully?	這個檔案已存在。要在匯出成功完成後取代它嗎？
+	Replace	取代
+	Export complete: {path}	匯出完成：{path}
+	Export cancelled	已取消匯出
+	Export failed: {error}	匯出失敗：{error}
+	The project changed. Start the export again to confirm its current settings.	專案已變更。請重新開始匯出，以確認目前的設定。

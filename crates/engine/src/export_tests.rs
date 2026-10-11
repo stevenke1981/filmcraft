@@ -576,8 +576,9 @@ fn ranges_resolve_and_sidecar_captions_are_written() {
     let srt = std::fs::read_to_string(dir.path("cap.srt")).unwrap();
     // timed from the start of the export range (In at 1 s; the caption starts on frame 35)
     assert!(srt.contains("Hello sidecar") && srt.contains("00:00:00,460 --> 00:00:01,461"), "{srt}");
-    s.execute("file.exportMedia", json!({"preset": "Waveform Audio 48 kHz 16-bit", "path": out, "captionSidecar": "vtt", "wait": true})).unwrap();
-    assert!(std::fs::read_to_string(dir.path("cap.vtt")).unwrap().starts_with("WEBVTT"));
+    s.execute("file.exportMedia", json!({"preset": "Waveform Audio 48 kHz 16-bit", "path": dir.path("cap-vtt.wav"), "captionSidecar": "vtt", "wait": true}))
+        .unwrap();
+    assert!(std::fs::read_to_string(dir.path("cap-vtt.vtt")).unwrap().starts_with("WEBVTT"));
     // a bad preset name is a clean error
     assert!(s.execute("file.exportMedia", json!({"preset": "Nope", "path": out})).is_err());
 }
@@ -595,4 +596,86 @@ fn default_export_dir_never_needs_a_real_filesystem() {
     // a saved project exports next to itself
     let s = Session { path: Some("/projects/show/edit.fcproj".into()), ..Default::default() };
     assert_eq!(crate::export_tools::default_export_dir(&s), std::path::PathBuf::from("/projects/show"));
+}
+
+#[test]
+fn export_safety_shared_reservation_rejects_ui_command_queue_and_other_session() {
+    let dir = Scratch::new("safety-shared");
+    let path = dir.path("shared.mp4");
+    let mut held = filmcraft_export::ExportSettings { path: path.clone(), ..Default::default() };
+    held.prepare_output().unwrap();
+    let mut ui = demo();
+    let mut agent = demo();
+    let error = ui.execute("file.exportMedia", json!({"path":path})).unwrap_err().to_string();
+    assert!(error.contains("busy"), "{error}");
+    let error = agent.execute("file.exportMedia", json!({"path":path,"overwrite":true})).unwrap_err().to_string();
+    assert!(error.contains("busy"), "{error}");
+    let queued = agent.execute("export.queue.add", json!({"path":path,"start":true,"wait":true})).unwrap();
+    assert_eq!(queued["items"][0]["status"], "failed");
+    assert!(queued["items"][0]["error"].as_str().unwrap().contains("busy"));
+    assert!(ui.jobs.is_empty() && agent.jobs.is_empty(), "rejected starts must not leave running jobs");
+    drop(held);
+    let mut fresh = filmcraft_export::ExportSettings { path, ..Default::default() };
+    fresh.prepare_output().unwrap();
+}
+
+#[test]
+fn export_safety_early_cancel_preserves_existing_mp4_without_cleanup_flag() {
+    use std::sync::atomic::Ordering;
+    let dir = Scratch::new("safety-old-cancel");
+    let path = dir.path("existing.mp4");
+    let mut s = demo();
+    let small = json!({"path":path,"width":64,"height":36,"fps":24,"audio":false,
+        "range":"custom","startSeconds":0,"endSeconds":1,"wait":true});
+    s.execute("file.exportMedia", small.clone()).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let unconfirmed = s.execute("file.exportMedia", small.clone()).unwrap_err().to_string();
+    assert!(unconfirmed.contains("confirmation"), "{unconfirmed}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let mut start = small;
+    start["overwrite"] = json!(true);
+    start["wait"] = json!(false);
+    start["endSeconds"] = json!(20);
+    let id = s.execute("file.exportMedia", start).unwrap()["job"].as_u64().unwrap();
+    s.execute("jobs.cancel", json!({"job":id})).unwrap();
+    let job = s.jobs.iter().find(|job| job.id == id).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !job.progress.finished.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline, "cancelled job did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(job.result.lock().unwrap().is_some(), "finished must imply terminal result");
+    assert_eq!(job.to_json()["result"]["error"], "cancelled");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let mut retry = filmcraft_export::ExportSettings { path, overwrite: true, ..Default::default() };
+    retry.prepare_output().unwrap();
+}
+
+#[test]
+fn export_safety_sidecar_preflight_preserves_existing_outputs() {
+    let dir = Scratch::new("safety-sidecar");
+    let path = dir.path("existing.mp4");
+    let sidecar = dir.path("existing.srt");
+    std::fs::write(&path, b"old video").unwrap();
+    std::fs::write(&sidecar, b"old captions").unwrap();
+    let mut s = demo();
+    s.execute("captions.add", json!({"seconds":0,"durationSeconds":1,"text":"New captions"})).unwrap();
+    let error = s.execute("file.exportMedia", json!({"path":path,"captionSidecar":"srt","overwrite":true})).unwrap_err().to_string();
+    assert!(error.contains("multi-file"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old video");
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"old captions");
+    assert!(s.jobs.is_empty());
+    let mut fresh = filmcraft_export::ExportSettings { path, overwrite: true, ..Default::default() };
+    fresh.prepare_output().unwrap();
+}
+
+#[test]
+fn export_safety_consent_is_never_imported_from_a_preset_or_settings_json() {
+    let s = demo();
+    let (_, settings) = crate::export_tools::settings_from_params(&s, &json!({"settings":{"overwrite":true}}), "file.exportMedia").unwrap();
+    assert!(!settings.overwrite);
+    let (_, settings) = crate::export_tools::settings_from_params(&s, &json!({"overwrite":true,"settings":{"overwrite":false}}), "file.exportMedia").unwrap();
+    assert!(settings.overwrite);
+    let saved = serde_json::to_value(settings).unwrap();
+    assert!(saved.get("overwrite").is_none());
 }

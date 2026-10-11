@@ -227,6 +227,7 @@ impl Exporter {
         let pipe = q.settings.color;
         let hdr_out = hdr_output(pipe.working.is_hdr(), settings.sdr, settings.video_format(), crate::hdr_available);
         let mut settings = settings.clone();
+        settings.prepare_output()?;
         settings.signal = match (hdr_out, pipe.working) {
             (true, filmcraft_color::WorkingSpace::Rec2100Pq) => ColorSignal::PQ,
             (true, _) => ColorSignal::HLG,
@@ -503,11 +504,14 @@ impl Exporter {
                 (w.finish(&self.settings)?, Vec::new())
             }
         };
+        self.settings.publish_output(progress)?;
         note_stage(Stage::Finish, finishing.elapsed());
         let secs = self.t0.elapsed().as_secs_f64();
         let nframes = self.frames();
         if !self.settings.part_of_batch {
-            progress.finished.store(true, Ordering::Relaxed);
+            if !self.settings.defer_finished {
+                progress.finished.store(true, Ordering::Release);
+            }
             progress.set_status(format!("Done in {secs:.1}s"));
         }
         Ok(Step::Done(Report {

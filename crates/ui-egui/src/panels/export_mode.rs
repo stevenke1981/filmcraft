@@ -57,6 +57,19 @@ pub struct ExportUi {
     pub quick_open: bool,
     pub quick_path: String,
     pub quick_preset: String,
+    /// A captured invocation awaiting consent; never restored from UI state or presets.
+    #[serde(skip)]
+    pub pending_overwrite: Option<PendingExport>,
+    #[serde(skip)]
+    pub reported_jobs: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingExport {
+    command: String,
+    params: Value,
+    revision: u64,
+    project: std::sync::Arc<filmcraft_engine::project::Project>,
 }
 
 impl Default for ExportUi {
@@ -76,6 +89,8 @@ impl Default for ExportUi {
             quick_open: false,
             quick_path: String::new(),
             quick_preset: String::new(),
+            pending_overwrite: None,
+            reported_jobs: Vec::new(),
         }
     }
 }
@@ -143,6 +158,93 @@ pub fn export_params(app: &FilmcraftApp) -> Value {
         p["endSeconds"] = json!(ex.custom_end);
     }
     p
+}
+
+fn execute_export(app: &mut FilmcraftApp, command: &str, params: Value) {
+    match app.session.execute(command, params) {
+        Ok(_) if command == "export.queue.add" => app.ui.status = tl!("Added to the export queue").into(),
+        Ok(v) => app.ui.status = tlf!("Exporting {path}", path = v["path"].as_str().unwrap_or("")),
+        Err(e) => app.ui.status = e.to_string(),
+    }
+}
+
+/// All export buttons capture their destination and settings before asking to replace a file.
+fn request_export(app: &mut FilmcraftApp, command: &str, mut params: Value) {
+    params["sequence"] = json!(app.session.state.active_sequence.map(|s| s.0));
+    let resolved = match app.session.execute("export.resolve", params.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            app.ui.status = e.to_string();
+            return;
+        }
+    };
+    params["path"] = resolved["settings"]["path"].clone();
+    params["overwrite"] = json!(false);
+    if params["path"].as_str().is_some_and(|p| std::path::Path::new(p).exists()) {
+        app.ui.export.pending_overwrite =
+            Some(PendingExport { command: command.into(), params, revision: app.session.revision, project: app.session.project.clone() });
+    } else {
+        execute_export(app, command, params);
+    }
+}
+
+fn confirm_export(app: &mut FilmcraftApp) {
+    let Some(pending) = app.ui.export.pending_overwrite.take() else { return };
+    if app.session.revision != pending.revision || !std::sync::Arc::ptr_eq(&app.session.project, &pending.project) {
+        app.ui.status = tl!("The project changed. Start the export again to confirm its current settings.").into();
+        return;
+    }
+    let mut params = pending.params;
+    params["overwrite"] = json!(true);
+    execute_export(app, &pending.command, params);
+}
+
+pub fn show_overwrite_confirmation(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let Some(pending) = app.ui.export.pending_overwrite.clone() else { return };
+    let mut replace = false;
+    let mut cancel = false;
+    let response = egui::Modal::new(egui::Id::new("export-overwrite-confirmation")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        ui.heading(tl!("Replace Export File?"));
+        ui.label(tl!("This file already exists. Replace it after the export completes successfully?"));
+        ui.label(pending.params["path"].as_str().unwrap_or(""));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let r = ui.button(tl!("Replace"));
+            app.auto.add("export.overwrite.replace", r.rect, "Replace");
+            replace = r.clicked();
+            let r = ui.button(tl!("Cancel"));
+            app.auto.add("export.overwrite.cancel", r.rect, "Cancel");
+            cancel = r.clicked();
+        });
+    });
+    if replace {
+        confirm_export(app);
+    } else if cancel || response.should_close() {
+        app.ui.export.pending_overwrite = None;
+    }
+}
+
+/// Publish completed export outcomes to the footer, including very short asynchronous jobs.
+pub fn settle_export_status(app: &mut FilmcraftApp) -> bool {
+    let mut changed = false;
+    for job in &app.session.jobs {
+        if app.ui.export.reported_jobs.contains(&job.id)
+            || !(job.label.starts_with("Export ") || job.label.starts_with("Quick Export ") || job.label.starts_with("Queue:"))
+        {
+            continue;
+        }
+        let result = job.result.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(result) = result.as_ref() else { continue };
+        app.ui.export.reported_jobs.push(job.id);
+        changed = true;
+        app.ui.status = match result {
+            Ok(report) => tlf!("Export complete: {path}", path = report.path),
+            Err(error) if error == "cancelled" => tl!("Export cancelled").into(),
+            Err(error) => tlf!("Export failed: {error}", error),
+        };
+    }
+    changed
 }
 
 fn sync_sequence(app: &mut FilmcraftApp) {
@@ -1006,11 +1108,8 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
     reg.add("export.button", go, "Export");
     reg.flush(app);
     if resp.clicked() {
-        let r = app.session.execute("file.exportMedia", export_params(app));
-        match r {
-            Ok(v) => app.ui.status = tlf!("Exporting {path}", path = v["path"].as_str().unwrap_or("")),
-            Err(e) => app.ui.status = e.to_string(),
-        }
+        let params = export_params(app);
+        request_export(app, "file.exportMedia", params);
     }
     if qresp.clicked() {
         let mut p = export_params(app);
@@ -1018,10 +1117,7 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
             // the queue shows which preset an item came from
             p["preset"] = json!(app.ui.export.preset);
         }
-        match app.session.execute("export.queue.add", p) {
-            Ok(_) => app.ui.status = tl!("Added to the export queue").into(),
-            Err(e) => app.ui.status = e.to_string(),
-        }
+        request_export(app, "export.queue.add", p);
     }
 }
 
@@ -1329,10 +1425,7 @@ pub fn quick_export(app: &mut FilmcraftApp, ctx: &egui::Context, anchor: egui::P
     reg.flush(app);
     if go {
         let p = json!({"preset": app.ui.export.quick_preset, "path": app.ui.export.quick_path});
-        match app.session.execute("export.quick", p) {
-            Ok(v) => app.ui.status = tlf!("Quick Export: {path}", path = v["path"].as_str().unwrap_or("")),
-            Err(e) => app.ui.status = e.to_string(),
-        }
+        request_export(app, "export.quick", p);
         close = true;
     }
     if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (clicked_elsewhere && !toggled) {
@@ -1353,4 +1446,134 @@ fn list_row(ui: &mut egui::Ui, t: &Tokens, selected: bool, text: &str, width: f3
     ui.painter().rect_filled(r, 3.0, bg);
     ui.painter().text(pos2(r.min.x + 6.0, r.center().y), Align2::LEFT_CENTER, text, Tokens::ui(12.5), if selected { Color32::WHITE } else { t.text });
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filmcraft_engine::{Job, Session};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("fc-export-ui-safety-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> String {
+            self.0.join("existing.mp4").to_str().unwrap().into()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn app() -> FilmcraftApp {
+        crate::i18n::set_current(crate::i18n::Language::En);
+        let mut session = Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        FilmcraftApp::new(session)
+    }
+    fn params(path: &str) -> Value {
+        json!({"path":path,"width":64,"height":36,"fps":24,"audio":false,
+            "range":"custom","startSeconds":0,"endSeconds":0.1,"wait":true})
+    }
+
+    #[test]
+    fn safety_export_quick_and_queue_buttons_require_fresh_consent() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        for command in ["file.exportMedia", "export.quick", "export.queue.add"] {
+            std::fs::write(&path, b"existing video").unwrap();
+            let mut app = app();
+            request_export(&mut app, command, params(&path));
+            let pending = app.ui.export.pending_overwrite.as_ref().unwrap();
+            assert_eq!(pending.command, command);
+            assert_eq!(pending.params["overwrite"], false);
+            assert!(app.session.jobs.is_empty() && app.session.export_queue.items.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), b"existing video");
+            confirm_export(&mut app);
+            assert!(app.ui.export.pending_overwrite.is_none());
+            if command == "export.queue.add" {
+                assert!(app.session.export_queue.items[0].settings.overwrite);
+                assert_eq!(std::fs::read(&path).unwrap(), b"existing video");
+            } else {
+                assert_ne!(std::fs::read(&path).unwrap(), b"existing video");
+                settle_export_status(&mut app);
+                assert_eq!(app.ui.status, format!("Export complete: {path}"));
+            }
+        }
+    }
+
+    #[test]
+    fn safety_intervening_project_edit_invalidates_pending_consent() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        std::fs::write(&path, b"existing video").unwrap();
+        let mut app = app();
+        request_export(&mut app, "file.exportMedia", params(&path));
+        app.session.execute("file.newBin", json!({"name":"Intervening edit"})).unwrap();
+        confirm_export(&mut app);
+        assert!(app.ui.status.starts_with("The project changed."));
+        assert!(app.session.jobs.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing video");
+        request_export(&mut app, "file.exportMedia", params(&path));
+        app.session.project = std::sync::Arc::new(filmcraft_engine::project::Project::new("Other project"));
+        confirm_export(&mut app);
+        assert!(app.ui.status.starts_with("The project changed."));
+        assert!(app.session.jobs.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing video");
+    }
+
+    #[test]
+    fn safety_outcomes_cover_all_routes_and_out_of_order_completion() {
+        let mut app = app();
+        for (id, label) in [(1, "Export output.mp4"), (2, "Quick Export quick.mp4"), (3, "Queue: Sequence -> queued.mp4")] {
+            app.session.jobs.push(Job { id, label: label.into(), progress: Default::default(), result: Default::default() });
+        }
+        *app.session.jobs[2].result.lock().unwrap() = Some(Err("cancelled".into()));
+        settle_export_status(&mut app);
+        assert_eq!(app.ui.status, "Export cancelled");
+        *app.session.jobs[1].result.lock().unwrap() = Some(Err("actual I/O error".into()));
+        settle_export_status(&mut app);
+        assert_eq!(app.ui.status, "Export failed: actual I/O error");
+        *app.session.jobs[0].result.lock().unwrap() = Some(Ok(filmcraft_engine::export::Report {
+            path: "output.mp4".into(),
+            frames: 24,
+            seconds: 1.0,
+            bytes: 1,
+            render_fps: 24.0,
+            extra_files: Vec::new(),
+        }));
+        settle_export_status(&mut app);
+        assert_eq!(app.ui.status, "Export complete: output.mp4");
+        assert_eq!(app.ui.export.reported_jobs.len(), 3);
+        app.ui.status = "another action".into();
+        settle_export_status(&mut app);
+        assert_eq!(app.ui.status, "another action");
+    }
+
+    #[test]
+    fn safety_prompts_and_outcomes_have_trilingual_translations() {
+        let strings = [
+            "Replace Export File?",
+            "This file already exists. Replace it after the export completes successfully?",
+            "Replace",
+            "Export complete: {path}",
+            "Export cancelled",
+            "Export failed: {error}",
+            "The project changed. Start the export again to confirm its current settings.",
+        ];
+        for language in [crate::i18n::Language::ZhTw, crate::i18n::Language::Ja, crate::i18n::Language::Es] {
+            for source in strings {
+                assert!(language.has(source), "{}: {source}", language.code());
+            }
+            let source = "Export complete: {path}";
+            let text = crate::i18n::fmt(language.tr(source), &[("path", "Video {name}.mp4")]);
+            assert!(text.contains("Video {name}.mp4"));
+        }
+    }
 }

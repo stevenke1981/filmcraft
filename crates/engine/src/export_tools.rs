@@ -10,6 +10,8 @@
 //!   [`ExportSettings`] JSON object in camelCase, merged over the preset) and a few flat
 //!   overrides (`format`, `width`/`height`, `fps`, `bitrateKbps`, …), plus `path`, `sequence` and
 //!   `range` (`entire` | `inOut` | `workArea` | `custom` with `start…` / `end…` times).
+//!   Flat `overwrite: true` is explicit consent for this invocation to replace an existing
+//!   single-file output after success; presets/settings JSON never carry that consent.
 //! - **Queue** (session state, not saved with the project). `export.queue.add` snapshots the
 //!   project and resolves the settings; `export.queue.start` encodes the ready items one after
 //!   another as ordinary background jobs ([`crate::Job`], visible in `jobs.list`); the frontend's
@@ -248,6 +250,8 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
         settings.effects.loudness.enabled = true;
         settings.effects.loudness.target_lufs = v;
     }
+    // Consent belongs to this command invocation, never to a stored preset/settings JSON.
+    settings.overwrite = bool_p(p, "overwrite").unwrap_or(false);
     settings.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok((preset, settings))
 }
@@ -376,24 +380,16 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
         filmcraft_captions::write(&doc, format, filmcraft_captions::WriteOptions { drop_frame: q.settings.drop_frame, rate: Some(q.settings.frame_rate) });
     let ext = if format == filmcraft_captions::Format::WebVtt { "vtt" } else { kind };
     let path = format!("{}.{ext}", settings.path.rsplit_once('.').map_or(settings.path.as_str(), |x| x.0));
-    s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if let Some(output) = &settings.native_output {
+        output.write(&path, &bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+    } else {
+        s.services.write_file(&path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    }
     Ok(Some(path))
 }
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
-pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
-    spawn_export_with_cleanup(s, project, seq, settings, label, wait, false)
-}
-
-fn spawn_export_with_cleanup(
-    s: &mut Session,
-    project: Arc<Project>,
-    seq: ItemId,
-    mut settings: ExportSettings,
-    label: String,
-    wait: bool,
-    cleanup: bool,
-) -> Result<u64> {
+pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
@@ -403,8 +399,10 @@ fn spawn_export_with_cleanup(
         settings.sink = Some(filmcraft_export::OutputSink(Arc::new(move |path: &str, data: Vec<u8>| services.write_file(path, &data))));
     }
     if let Some(dir) = Path::new(&settings.path).parent().filter(|d| !d.as_os_str().is_empty() && !s.services.export_in_memory()) {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: I/O: {e}", dir.display())))?;
     }
+    settings.prepare_output().map_err(|e| EngineError::Other(e.to_string()))?;
+    settings.defer_finished = true;
     write_sidecar(s, &project, seq, &settings)?;
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
@@ -421,27 +419,31 @@ fn spawn_export_with_cleanup(
     }
     let run = move || {
         let mut r = filmcraft_export::export(&project, seq, &settings, &provider, &prog).map_err(|e| e.to_string());
-        // Scoped agent MP4 jobs opt in: publish completion only after their partial file is removed.
-        if cleanup
-            && r.as_ref().is_err_and(|e| e == "cancelled")
-            && settings.sink.is_none()
-            && let Err(e) = std::fs::remove_file(&settings.path)
-            && e.kind() != std::io::ErrorKind::NotFound
+        // Clean job-owned staging before the terminal result, retaining the destination reservation
+        // until that result is stored under its mutex; ownership drops before the finished flag.
+        if let Some(output) = &settings.native_output
+            && let Err(e) = output.cleanup_staging()
         {
-            r = Err(format!("cancelled; could not remove partial output: {e}"));
+            r = Err(format!("{}; {e}", r.as_ref().err().map(String::as_str).unwrap_or("export completed")));
         }
         if let Err(e) = &r {
             *prog.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
-            prog.finished.store(true, Ordering::Relaxed);
+            *prog.status.lock().unwrap_or_else(|x| x.into_inner()) = if e == "cancelled" { "Cancelled".into() } else { format!("Failed: {e}") };
         }
-        *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
+        // A queue/result observer must not start its next job while this output is still busy.
+        // Store the terminal result first, then release ownership under the same result lock.
+        let mut terminal = res.lock().unwrap_or_else(|x| x.into_inner());
+        *terminal = Some(r);
+        drop(settings);
+        prog.finished.store(true, Ordering::Release);
     };
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
-    s.jobs.push(job);
     if wait || cfg!(target_arch = "wasm32") {
+        s.jobs.push(job);
         run();
     } else {
         std::thread::Builder::new().name("filmcraft-export".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        s.jobs.push(job);
     }
     Ok(id)
 }
@@ -458,8 +460,8 @@ pub(crate) fn guard_job(
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
             let msg = "internal error (see the crash log); the job was stopped".to_string();
             *progress.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(msg.clone());
-            progress.finished.store(true, Ordering::Relaxed);
             *result.lock().unwrap_or_else(|x| x.into_inner()) = Some(Err(msg));
+            progress.finished.store(true, Ordering::Release);
         }
     }
 }
@@ -485,7 +487,7 @@ pub fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
     if cleanup && settings.format != Format::H264 {
         return Err(bad(cmd, "removeCancelledOutput is supported only for H.264 MP4"));
     }
-    let id = spawn_export_with_cleanup(s, project, seq, settings, format!("Export {}", file_name(&path)), wait, cleanup)?;
+    let id = spawn_export(s, project, seq, settings, format!("Export {}", file_name(&path)), wait)?;
     let mut out = json!({"job": id, "path": path});
     if let Some(pr) = preset {
         out["preset"] = json!(pr.name);
@@ -1063,7 +1065,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "export.queue.add",
             "Send to Export Queue",
-            r#"{…settings params,"path":str|dir?,"sequences":[id]?,"ranges":[range]?,"start":bool?,"wait":bool?}"#,
+            r#"{…settings params,"path":str|dir?,"overwrite":bool=false,"sequences":[id]?,"ranges":[range]?,"start":bool?,"wait":bool?}"#,
             has_seq,
             queue_add,
             true,
@@ -1076,7 +1078,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("export.queue.remove", "Remove Queued Export", r#"{"id":id}"#, always, queue_remove, true),
         spec("export.queue.move", "Reorder Queued Export", r#"{"id":id,"to":index?,"by":int?}"#, always, queue_move, true),
         spec("export.queue.clear", "Clear Finished Exports", r#"{"all":bool=false}"#, always, queue_clear, true),
-        spec("export.quick", "Quick Export", r#"{"preset":str?,"path":str?,"wait":bool?, …settings params}"#, has_seq, quick, true),
+        spec("export.quick", "Quick Export", r#"{"preset":str?,"path":str?,"overwrite":bool=false,"wait":bool?, …settings params}"#, has_seq, quick, true),
     ]
 }
 

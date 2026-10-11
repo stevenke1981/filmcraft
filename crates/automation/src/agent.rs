@@ -464,6 +464,11 @@ impl FilmcraftMcp {
                         w.document(&document).map_err(|e| error("WORKSPACE_VIOLATION", e))?;
                     }
                     params["path"] = json!(normalized);
+                    if id == "file.exportMedia" {
+                        // The shared exporter captures whether this confirmed target exists now;
+                        // a fresh target still publishes with no-clobber semantics.
+                        params["overwrite"] = json!(guard.confirm);
+                    }
                 }
                 "file.import" => {
                     let paths = params["paths"].as_array().ok_or_else(|| error("INVALID_PARAMS", "paths must be an array"))?;
@@ -532,6 +537,7 @@ impl FilmcraftMcp {
 mod tests {
     use super::*;
     use filmcraft_engine::Session;
+    use std::sync::Arc;
 
     fn guard(id: &str, revision: u64, confirm: bool) -> Guard {
         Guard { request_id: id.into(), revision, confirm }
@@ -549,6 +555,65 @@ mod tests {
         assert_eq!(resolved.parent(), Some(std::env::temp_dir().canonicalize().unwrap().as_path()));
         assert!(resolved.file_name().unwrap().to_string_lossy().starts_with(&format!("filmcraft-agent-{}-", std::process::id())));
         std::fs::remove_dir_all(resolved).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_guard_confirmation_is_forwarded_to_the_shared_exporter() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (_, root) = server("export-consent");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let capture = seen.clone();
+        let fake = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut next_job = 1;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let reply = match request["params"]["command"].as_str() {
+                    Some("project.inspect") => json!({"revision":0,"dirty":false}),
+                    Some("project.document") => json!({}),
+                    Some("agent.execute") => {
+                        capture.lock().await.push(request["params"]["params"].clone());
+                        let reply = json!({"job":next_job,"path":request["params"]["params"]["params"]["path"]});
+                        next_job += 1;
+                        reply
+                    }
+                    Some("jobs.list") => json!([]),
+                    _ => json!(null),
+                };
+                write.write_all(format!("{}\n", json!({"id":request["id"],"ok":true,"result":reply})).as_bytes()).await.unwrap();
+            }
+        });
+        let server = FilmcraftMcp::bridge(&addr).unwrap().with_workspace(&root).unwrap();
+        std::fs::write(root.join("existing.mp4"), b"old video").unwrap();
+        for (request_id, path, confirm) in [("fresh-no", "fresh-no.mp4", false), ("fresh-yes", "fresh-yes.mp4", true), ("existing-yes", "existing.mp4", true)] {
+            let request =
+                serde_json::from_value(json!({"guard":{"request_id":request_id,"revision":0,"confirm":confirm},"path":path,"width":64,"height":36,"fps":24}))
+                    .unwrap();
+            let result = server.agent_export(request).await;
+            assert_eq!(result["ok"], true, "{result}");
+        }
+        let denied = server
+            .agent_export(
+                serde_json::from_value(json!({"guard":{"request_id":"existing-no","revision":0},"path":"existing.mp4","width":64,"height":36,"fps":24}))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(denied["error"]["code"], "CONFIRMATION_REQUIRED");
+        let captured = seen.lock().await;
+        assert_eq!(captured.len(), 3, "unconfirmed replacement must not reach the app");
+        for (request, confirm) in captured.iter().zip([false, true, true]) {
+            assert_eq!(request["command"], "file.exportMedia");
+            assert_eq!(request["params"]["overwrite"], confirm);
+        }
+        assert_eq!(std::fs::read(root.join("existing.mp4")).unwrap(), b"old video");
+        drop(captured);
+        drop(server);
+        fake.abort();
+        cleanup(root);
     }
 
     #[tokio::test]

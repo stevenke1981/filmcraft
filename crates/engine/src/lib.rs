@@ -478,13 +478,14 @@ impl Session {
                 Ok(filmcraft_export::Step::Pending) => return true,
                 Ok(filmcraft_export::Step::Done(r)) => {
                     *j.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(r));
+                    j.progress.finished.store(true, std::sync::atomic::Ordering::Release);
                     self.stepped.remove(0);
                 }
                 Err(e) => {
                     let e = e.to_string();
                     *j.progress.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
-                    j.progress.finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     *j.result.lock().unwrap_or_else(|x| x.into_inner()) = Some(Err(e));
+                    j.progress.finished.store(true, std::sync::atomic::Ordering::Release);
                     self.stepped.remove(0);
                 }
             }

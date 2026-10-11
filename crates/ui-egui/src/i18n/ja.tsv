@@ -936,3 +936,10 @@
 	Channel Volume	チャンネルボリューム
 	Panner	パン
 	Balance	バランス
+	Replace Export File?	書き出しファイルを置き換えますか？
+	This file already exists. Replace it after the export completes successfully?	このファイルは既に存在します。書き出しが正常に完了した後で置き換えますか？
+	Replace	置き換え
+	Export complete: {path}	書き出し完了：{path}
+	Export cancelled	書き出しをキャンセルしました
+	Export failed: {error}	書き出しに失敗しました：{error}
+	The project changed. Start the export again to confirm its current settings.	プロジェクトが変更されました。書き出しを再開して現在の設定を確認してください。

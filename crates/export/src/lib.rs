@@ -18,6 +18,7 @@ use std::io::Write;
 mod audio_out;
 mod job;
 mod mxf_out;
+mod output;
 mod pace;
 mod pcm;
 mod pipeline;
@@ -27,6 +28,7 @@ pub mod still;
 pub use audio_out::LoudnessReport;
 pub use job::{Exporter, Step, stepped};
 pub use mxf_out::opatom_audio_paths;
+pub use output::NativeOutput;
 pub use pcm::{image_sequence_path, write_aiff, write_wav};
 pub use pipeline::limit_rgba8;
 pub use presets::{ExportPreset, builtin_presets};
@@ -223,6 +225,10 @@ pub enum H264Pass {
 pub struct ExportSettings {
     pub format: Format,
     pub path: String,
+    /// Explicit consent to replace an existing single-file output, captured at job creation.
+    /// Fresh destinations always use no-clobber publication, even when this is true.
+    #[serde(skip)]
+    pub overwrite: bool,
     /// Timeline range (default: In/Out if set, else the whole sequence).
     pub range: Option<TimeRange>,
     /// Output scale (1.0 = sequence frame size).
@@ -307,6 +313,12 @@ pub struct ExportSettings {
     /// writing `path` (hosts without a filesystem: the web app offers the file as a download).
     #[serde(skip)]
     pub sink: Option<OutputSink>,
+    /// Job-owned native staging and process-wide destination reservations.
+    #[serde(skip)]
+    pub native_output: Option<Arc<NativeOutput>>,
+    /// The engine publishes its result before setting the terminal progress flag.
+    #[serde(skip)]
+    pub defer_finished: bool,
 }
 
 /// Receives in-memory export output: `(path, bytes)` per finished file.
@@ -321,7 +333,7 @@ impl std::fmt::Debug for OutputSink {
 
 /// An export's output file: on disk, or in memory for an [`OutputSink`].
 enum Out {
-    File(std::io::BufWriter<std::fs::File>),
+    File(std::io::BufWriter<std::fs::File>, Arc<NativeOutput>),
     Mem(std::io::Cursor<Vec<u8>>),
 }
 
@@ -335,8 +347,9 @@ impl Out {
         if settings.sink.is_some() {
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
-        let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
-        Ok(Out::File(std::io::BufWriter::new(f)))
+        let output = settings.native_output.as_ref().ok_or_else(|| ExportError::Io("native export output was not reserved".into()))?;
+        let f = output.create(path)?;
+        Ok(Out::File(std::io::BufWriter::new(f), output.clone()))
     }
 
     /// Flush (and hand in-memory output to the sink); returns the file size.
@@ -346,9 +359,12 @@ impl Out {
 
     fn finish_path(self, settings: &ExportSettings, path: &str) -> Result<u64> {
         match self {
-            Out::File(mut w) => {
-                w.flush().map_err(|e| ExportError::Io(e.to_string()))?;
-                Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            Out::File(mut w, output) => {
+                w.flush().and_then(|()| w.get_ref().sync_all()).map_err(|e| ExportError::Io(e.to_string()))?;
+                let bytes = w.get_ref().metadata().map_err(|e| ExportError::Io(e.to_string()))?.len();
+                drop(w);
+                output.ready(path)?;
+                Ok(bytes)
             }
             Out::Mem(c) => write_output(settings, path, c.into_inner()),
         }
@@ -359,23 +375,22 @@ impl Out {
 fn write_output(settings: &ExportSettings, path: &str, data: Vec<u8>) -> Result<u64> {
     let n = data.len() as u64;
     match &settings.sink {
-        Some(sink) => (sink.0)(path, data),
-        None => std::fs::write(path, &data),
+        Some(sink) => (sink.0)(path, data).map_err(|e| ExportError::Io(e.to_string()))?,
+        None => settings.native_output.as_ref().ok_or_else(|| ExportError::Io("native export output was not reserved".into()))?.write(path, &data)?,
     }
-    .map_err(|e| ExportError::Io(e.to_string()))?;
     Ok(n)
 }
 
 impl Write for Out {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Out::File(w) => w.write(buf),
+            Out::File(w, _) => w.write(buf),
             Out::Mem(w) => w.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Out::File(w) => w.flush(),
+            Out::File(w, _) => w.flush(),
             Out::Mem(w) => w.flush(),
         }
     }
@@ -384,7 +399,7 @@ impl Write for Out {
 impl std::io::Seek for Out {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match self {
-            Out::File(w) => w.seek(pos),
+            Out::File(w, _) => w.seek(pos),
             Out::Mem(w) => w.seek(pos),
         }
     }
@@ -446,6 +461,7 @@ impl Default for ExportSettings {
         Self {
             format: Format::H264,
             path: String::new(),
+            overwrite: false,
             range: None,
             scale: 1.0,
             include_audio: true,
@@ -481,11 +497,30 @@ impl Default for ExportSettings {
             h264_pass: H264Pass::Single,
             signal: ColorSignal::default(),
             sink: None,
+            native_output: None,
+            defer_finished: false,
         }
     }
 }
 
 impl ExportSettings {
+    /// Reserve native destinations before spawning a job. Direct exporters call this as well.
+    pub fn prepare_output(&mut self) -> Result<()> {
+        if self.sink.is_none() && self.native_output.is_none() {
+            self.native_output = Some(Arc::new(NativeOutput::new(&self.path, self.overwrite, self.is_image_sequence())?));
+        }
+        Ok(())
+    }
+
+    fn publish_output(&self, progress: &Progress) -> Result<()> {
+        if let Some(output) = &self.native_output {
+            output.publish(&progress.cancel)?;
+        } else if progress.cancel.load(Ordering::Relaxed) {
+            return Err(ExportError::Cancelled);
+        }
+        Ok(())
+    }
+
     /// Reject settings the encoders cannot honour.
     pub fn validate(&self) -> Result<()> {
         if let Some(range) = self.range {
@@ -1468,6 +1503,9 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
             }
         }
     }
+    let mut settings = settings.clone();
+    settings.prepare_output()?;
+    let settings = &settings;
     let t0 = web_time::Instant::now();
     let range = export_range(project, seq, settings)?;
     let cancelled = || progress.cancel.load(Ordering::Relaxed);
@@ -1548,9 +1586,12 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
             return Err(ExportError::Unsupported(format!("{:?} must run as a stepped export", settings.format)));
         }
     };
+    settings.publish_output(progress)?;
     let secs = t0.elapsed().as_secs_f64();
     if !settings.part_of_batch {
-        progress.finished.store(true, Ordering::Relaxed);
+        if !settings.defer_finished {
+            progress.finished.store(true, Ordering::Release);
+        }
         progress.set_status(format!("Done in {secs:.1}s"));
     }
     Ok(Report { path: settings.path.clone(), frames: nframes, seconds: secs, bytes, render_fps: nframes as f64 / secs.max(1e-6), extra_files: Vec::new() })

@@ -3494,3 +3494,10 @@
 	hardware encoder	codificador de hardware
 	Image sequence	Secuencia de imágenes
 	Menus	Menús
+	Replace Export File?	¿Reemplazar el archivo de exportación?
+	This file already exists. Replace it after the export completes successfully?	Este archivo ya existe. ¿Reemplazarlo cuando la exportación termine correctamente?
+	Replace	Reemplazar
+	Export complete: {path}	Exportación completada: {path}
+	Export cancelled	Exportación cancelada
+	Export failed: {error}	Error de exportación: {error}
+	The project changed. Start the export again to confirm its current settings.	El proyecto ha cambiado. Inicia la exportación de nuevo para confirmar su configuración actual.

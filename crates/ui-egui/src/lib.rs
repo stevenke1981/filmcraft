@@ -1374,6 +1374,7 @@ impl FilmcraftApp {
             state::Mode::Export => panels::export_mode::show(self, ui, body),
         }
         panels::dialogs::show(self, &ctx);
+        panels::export_mode::show_overwrite_confirmation(self, &ctx);
         if !self.ui.show_status_bar {
             // no bar to draw the job in, but a finished preview render still plays
             self.watch_jobs(ui.ctx());
@@ -1405,6 +1406,9 @@ impl FilmcraftApp {
     /// render completes. Runs every frame, with or without the status bar.
     fn watch_jobs(&mut self, ctx: &egui::Context) -> Option<filmcraft_engine::Job> {
         use std::sync::atomic::Ordering;
+        if panels::export_mode::settle_export_status(self) {
+            ctx.request_repaint();
+        }
         let running = self.session.jobs.iter().rev().find(|j| !j.progress.finished.load(Ordering::Relaxed)).cloned();
         // Play after rendering previews.
         if let Some((id, from)) = self.watched_render
