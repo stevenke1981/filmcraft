@@ -1,5 +1,6 @@
 # Interface catalog. context<TAB>English source<TAB>translation.
 # Original translations under MIT OR Apache-2.0. Untranslated strings fall back to English.
+	The export settings changed. Start the export again to confirm its current settings.	匯出設定已變更。請重新開始匯出，以確認目前的設定。
 	About FilmCraft	關於 FilmCraft
 	Add Audio Submix Track	新增音訊子混音軌
 	Add Caption at Playhead	在播放頭新增字幕

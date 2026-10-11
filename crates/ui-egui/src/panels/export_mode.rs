@@ -68,6 +68,8 @@ pub struct ExportUi {
 pub struct PendingExport {
     command: String,
     params: Value,
+    /// Settings, effective range, derived output and final destination shown before consent.
+    resolved: Value,
     revision: u64,
     project: std::sync::Arc<filmcraft_engine::project::Project>,
 }
@@ -171,6 +173,7 @@ fn execute_export(app: &mut FilmcraftApp, command: &str, params: Value) {
 /// All export buttons capture their destination and settings before asking to replace a file.
 fn request_export(app: &mut FilmcraftApp, command: &str, mut params: Value) {
     params["sequence"] = json!(app.session.state.active_sequence.map(|s| s.0));
+    params["overwrite"] = json!(false);
     let resolved = match app.session.execute("export.resolve", params.clone()) {
         Ok(v) => v,
         Err(e) => {
@@ -179,10 +182,9 @@ fn request_export(app: &mut FilmcraftApp, command: &str, mut params: Value) {
         }
     };
     params["path"] = resolved["settings"]["path"].clone();
-    params["overwrite"] = json!(false);
     if params["path"].as_str().is_some_and(|p| std::path::Path::new(p).exists()) {
         app.ui.export.pending_overwrite =
-            Some(PendingExport { command: command.into(), params, revision: app.session.revision, project: app.session.project.clone() });
+            Some(PendingExport { command: command.into(), params, resolved, revision: app.session.revision, project: app.session.project.clone() });
     } else {
         execute_export(app, command, params);
     }
@@ -192,6 +194,19 @@ fn confirm_export(app: &mut FilmcraftApp) {
     let Some(pending) = app.ui.export.pending_overwrite.take() else { return };
     if app.session.revision != pending.revision || !std::sync::Arc::ptr_eq(&app.session.project, &pending.project) {
         app.ui.status = tl!("The project changed. Start the export again to confirm its current settings.").into();
+        return;
+    }
+    // Preset edits/imports do not change the project revision or Arc. Re-resolve before
+    // granting overwrite so consent cannot follow changed settings to another destination.
+    let resolved = match app.session.execute("export.resolve", pending.params.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            app.ui.status = error.to_string();
+            return;
+        }
+    };
+    if resolved != pending.resolved {
+        app.ui.status = tl!("The export settings changed. Start the export again to confirm its current settings.").into();
         return;
     }
     let mut params = pending.params;
@@ -1508,6 +1523,122 @@ mod tests {
         }
     }
 
+    fn quick_preset_change_invalidates_pending_consent(import: bool) {
+        let dir = Scratch::new();
+        let path = dir.0.join("a.mp4").to_str().unwrap().to_string();
+        let changed_path = format!("{path}.wav");
+        std::fs::write(&path, b"old MP4 target").unwrap();
+        std::fs::write(&changed_path, b"old WAV target").unwrap();
+        let mut app = app();
+        let name = "Consent drift regression";
+        app.session.execute("export.presets.save", json!({"name":name,"format":"h264"})).unwrap();
+        let mut invocation = params(&path);
+        invocation.as_object_mut().unwrap().remove("audio");
+        invocation["preset"] = json!(name);
+        request_export(&mut app, "export.quick", invocation.clone());
+        assert_eq!(app.ui.export.pending_overwrite.as_ref().unwrap().params["path"], path);
+        let revision = app.session.revision;
+        let project = app.session.project.clone();
+        if import {
+            let mut preset = app.session.export_presets.find(name).unwrap();
+            preset.settings.format = Format::Wav;
+            let import_path = dir.0.join("changed-presets.json");
+            std::fs::write(&import_path, serde_json::to_vec(&json!({"format":"filmcraft.export-presets","version":1,"presets":[preset]})).unwrap()).unwrap();
+            app.session.execute("export.presets.import", json!({"path":import_path})).unwrap();
+        } else {
+            app.session.execute("export.presets.save", json!({"name":name,"format":"wav"})).unwrap();
+        }
+        assert_eq!(app.session.revision, revision, "preset saves do not bump the project revision");
+        assert!(std::sync::Arc::ptr_eq(&app.session.project, &project));
+        confirm_export(&mut app);
+        let old_target = std::fs::read(&path).unwrap();
+        let new_target = std::fs::read(&changed_path).unwrap();
+        eprintln!(
+            "quick preset consent oracle: import={import}, revision={revision}, jobs={}, status={}, MP4 preserved={}, WAV preserved={}, WAV bytes={}, header={:?}",
+            app.session.jobs.len(),
+            app.ui.status,
+            old_target == b"old MP4 target",
+            new_target == b"old WAV target",
+            new_target.len(),
+            &new_target[..new_target.len().min(12)]
+        );
+        for job in &app.session.jobs {
+            eprintln!("quick preset consent job: {:?}", *job.result.lock().unwrap());
+        }
+        assert!(old_target == b"old MP4 target" && new_target == b"old WAV target", "consent must not move to the preset's new target");
+        assert!(app.session.jobs.is_empty());
+        assert!(app.ui.export.pending_overwrite.is_none());
+        assert!(app.ui.status.starts_with("The export settings changed."));
+        request_export(&mut app, "export.quick", invocation);
+        assert_eq!(app.ui.export.pending_overwrite.as_ref().unwrap().params["path"], changed_path, "a fresh prompt must show the actual WAV destination");
+        assert!(app.session.jobs.is_empty());
+        assert_eq!(std::fs::read(&changed_path).unwrap(), b"old WAV target");
+        confirm_export(&mut app);
+        assert!(app.ui.export.pending_overwrite.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old MP4 target");
+        let wav = std::fs::read(&changed_path).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let declared = u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize + 8;
+        assert_eq!(declared, wav.len(), "the explicitly reconfirmed WAV is complete");
+        let report = app.session.jobs[0].result.lock().unwrap().clone().unwrap().unwrap();
+        assert_eq!(report.path, changed_path);
+        assert_eq!(report.bytes, wav.len() as u64);
+        eprintln!("quick fresh-confirm oracle: import={import}, report={report:?}, MP4 preserved=true, complete WAV bytes={}", wav.len());
+    }
+
+    #[test]
+    fn safety_quick_preset_save_invalidates_pending_consent() {
+        quick_preset_change_invalidates_pending_consent(false);
+    }
+
+    #[test]
+    fn safety_quick_preset_import_invalidates_pending_consent() {
+        quick_preset_change_invalidates_pending_consent(true);
+    }
+
+    #[test]
+    fn safety_quick_same_path_settings_change_invalidates_pending_consent() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        std::fs::write(&path, b"old target").unwrap();
+        let mut app = app();
+        let name = "Same path consent regression";
+        app.session.execute("export.presets.save", json!({"name":name,"format":"h264","bitrateKbps":1000})).unwrap();
+        let mut invocation = params(&path);
+        invocation["preset"] = json!(name);
+        request_export(&mut app, "export.quick", invocation);
+        let pending = app.ui.export.pending_overwrite.as_ref().unwrap().clone();
+        app.session.execute("export.presets.save", json!({"name":name,"format":"h264","bitrateKbps":2000})).unwrap();
+        let current = app.session.execute("export.resolve", pending.params).unwrap();
+        assert_eq!(current["settings"]["path"], path);
+        assert_ne!(current["settings"]["bitrateKbps"], pending.resolved["settings"]["bitrateKbps"]);
+        assert_eq!(app.session.revision, pending.revision);
+        assert!(std::sync::Arc::ptr_eq(&app.session.project, &pending.project));
+        confirm_export(&mut app);
+        assert!(app.ui.status.starts_with("The export settings changed."));
+        assert!(app.session.jobs.is_empty() && app.ui.export.pending_overwrite.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old target");
+    }
+
+    #[test]
+    fn safety_quick_deleted_preset_clears_consent_without_exporting() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        std::fs::write(&path, b"old target").unwrap();
+        let mut app = app();
+        let name = "Deleted consent regression";
+        app.session.execute("export.presets.save", json!({"name":name,"format":"h264"})).unwrap();
+        let mut invocation = params(&path);
+        invocation["preset"] = json!(name);
+        request_export(&mut app, "export.quick", invocation);
+        app.session.execute("export.presets.delete", json!({"name":name})).unwrap();
+        confirm_export(&mut app);
+        assert!(app.ui.status.contains("no export preset named"));
+        assert!(app.session.jobs.is_empty() && app.ui.export.pending_overwrite.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old target");
+    }
+
     #[test]
     fn safety_intervening_project_edit_invalidates_pending_consent() {
         let dir = Scratch::new();
@@ -1566,6 +1697,7 @@ mod tests {
             "Export cancelled",
             "Export failed: {error}",
             "The project changed. Start the export again to confirm its current settings.",
+            "The export settings changed. Start the export again to confirm its current settings.",
         ];
         for language in [crate::i18n::Language::ZhTw, crate::i18n::Language::Ja, crate::i18n::Language::Es] {
             for source in strings {

@@ -35,6 +35,10 @@ After every required output is flushed, synced and closed, publication uses:
 Stored presets and settings JSON cannot import consent. MCP v1 forwards `guard.confirm` to the
 same engine parameter. Export/Quick Export/Send to Queue buttons capture the invocation and ask
 before replacement; an intervening project edit or replacement invalidates that captured consent.
+Confirmation also re-resolves and compares the complete settings, effective range, derived output
+and final destination. Preset save/import changes require a fresh export request and confirmation,
+even when they leave the project revision and identity unchanged. A missing/deleted preset aborts
+the pending request with an error; the old overwrite consent is cleared.
 The UI reports completed, cancelled and failed export jobs, including short jobs and out-of-order
 completion. Safety prompts/outcomes have English source and Traditional Chinese, Japanese and
 Spanish translations; Portuguese retains the existing menu-only catalog/fallback contract.
@@ -54,7 +58,11 @@ roll back published files. No power-loss durability guarantee is made.
 
 The legacy H.264-only `removeCancelledOutput` parameter is retained for compatibility. It no longer
 controls final-file deletion: job-owned staging cleanup applies to every native export format.
-In-memory/web sinks retain their previous behavior and are outside this native safety repair.
+In-memory/web sinks commit each file when their callback accepts the complete bytes. Cancellation
+raised by that callback does not turn an already delivered single-file export into a cancelled
+result. Blocking WAV and stepped MJPEG regressions parse the delivered container and check its
+samples/frames plus a successful report with the cancellation flag still set. This is not a new
+atomic sink contract for multi-file exports; later work or a later callback can still fail.
 
 Focused regressions live in `output::tests`, engine `export_tests`, UI `export_mode::tests` and
 automation `agent::tests`. They cover untouched complete MP4 bytes across early/mid cancellation,

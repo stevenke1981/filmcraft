@@ -48,6 +48,74 @@ fn tmp(name: &str) -> String {
     d.join(name).to_string_lossy().to_string()
 }
 
+fn memory_sink_cancel_after_delivery(stepped: bool) {
+    let (p, seq, sources) = project();
+    let progress = Arc::new(Progress::default());
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let captured = delivered.clone();
+    let cancel = progress.clone();
+    let path = if stepped { "delivered.mov" } else { "delivered.wav" };
+    let settings = ExportSettings {
+        format: if stepped { Format::Mjpeg } else { Format::Wav },
+        path: path.into(),
+        scale: 0.2,
+        range: Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2))),
+        sink: Some(OutputSink(Arc::new(move |path, bytes| {
+            captured.lock().unwrap().push((path.to_string(), bytes));
+            cancel.cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        }))),
+        ..Default::default()
+    };
+    let result = if stepped {
+        let mut exporter = job::Exporter::new(p, seq, &settings, &progress).unwrap();
+        loop {
+            match exporter.step(&sources, &progress) {
+                Ok(job::Step::Done(report)) => break Ok(report),
+                Ok(job::Step::Progress | job::Step::Pending) => {}
+                Err(error) => break Err(error),
+            }
+        }
+    } else {
+        export(&p, seq, &settings, &sources, &progress)
+    };
+    let files = delivered.lock().unwrap();
+    assert_eq!(files.len(), 1, "the real sink callback must have delivered exactly one file");
+    let (delivered_path, bytes) = &files[0];
+    assert_eq!(delivered_path, path);
+    let decoded = filmcraft_codecs::open_bytes(path, Arc::from(bytes.clone())).unwrap();
+    assert!((decoded.info().duration.seconds() - 2.0 / 24.0).abs() < 0.002);
+    if stepped {
+        assert_eq!(decoded.info().video.as_ref().unwrap().width, 64);
+        let frame = decoded.video_frame(FrameRequest::full(Tick::ZERO)).unwrap().to_rgba8();
+        assert!(frame[0] > 230 && frame[1] < 30, "the delivered MOV contains the synthetic red frame");
+    } else {
+        assert_eq!(decoded.info().audio_streams[0].sample_rate, 48_000);
+        assert_eq!(decoded.audio(0, 4000, 48_000).unwrap().frames(), 4000);
+    }
+    assert!(progress.cancel.load(Ordering::Relaxed));
+    eprintln!(
+        "memory sink late-cancel oracle: stepped={stepped}, delivered={path}, bytes={}, decoded_seconds={}, cancel=true, result={result:?}",
+        bytes.len(),
+        decoded.info().duration.seconds()
+    );
+    let report = result.expect("a successfully delivered complete file must report success despite cancellation in the sink callback");
+    assert_eq!(report.path, path);
+    assert_eq!(report.frames, if stepped { 2 } else { 4000 });
+    assert_eq!(report.bytes, bytes.len() as u64);
+    assert!(progress.finished.load(Ordering::Acquire));
+}
+
+#[test]
+fn memory_sink_blocking_cancel_after_delivery_reports_success() {
+    memory_sink_cancel_after_delivery(false);
+}
+
+#[test]
+fn memory_sink_stepped_cancel_after_delivery_reports_success() {
+    memory_sink_cancel_after_delivery(true);
+}
+
 #[test]
 fn mjpeg_mov_roundtrip() {
     let (p, seq, m) = project();

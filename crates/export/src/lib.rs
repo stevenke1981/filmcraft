@@ -515,9 +515,9 @@ impl ExportSettings {
     fn publish_output(&self, progress: &Progress) -> Result<()> {
         if let Some(output) = &self.native_output {
             output.publish(&progress.cancel)?;
-        } else if progress.cancel.load(Ordering::Relaxed) {
-            return Err(ExportError::Cancelled);
         }
+        // Memory sinks already accepted the completed bytes in write_output/Out::finish.
+        // A cancellation raised by that callback cannot undo the delivery.
         Ok(())
     }
 

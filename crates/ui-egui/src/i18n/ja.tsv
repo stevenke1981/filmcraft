@@ -1,5 +1,6 @@
 # Interface catalog. context<TAB>English source<TAB>translation.
 # Original translations under MIT OR Apache-2.0. Untranslated strings fall back to English.
+	The export settings changed. Start the export again to confirm its current settings.	書き出し設定が変更されました。書き出しをやり直して、現在の設定を確認してください。
 	Clip	クリップ
 	Sequence	シーケンス
 	Markers	マーカー
