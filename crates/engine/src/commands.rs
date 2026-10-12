@@ -714,7 +714,7 @@ fn marker_list_mut(s: &mut Session) -> Result<(ItemId, Tick)> {
 fn build() -> Vec<CommandSpec> {
     let mut v = vec![
         // ================= File =================
-        cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str}"#, always, |s, p| {
+        cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str,"force":bool? (confirmed discard)}"#, always, |s, p| {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
             s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
             s.history = Default::default();
@@ -725,10 +725,11 @@ fn build() -> Vec<CommandSpec> {
             }
             s.revision += 1;
             s.saved_revision = s.revision;
+            s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
             s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             Ok(Value::Null)
         }),
-        cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
+        cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, r#"{"force":bool? (confirmed discard)}"#, always, |s, _| {
             let (p, seq) = crate::demo::demo_project(&s.media);
             s.project = std::sync::Arc::new(p);
             s.history = Default::default();
@@ -737,8 +738,12 @@ fn build() -> Vec<CommandSpec> {
             s.state.active_sequence = Some(seq);
             s.state.open_sequences = vec![seq];
             s.state.playheads.insert(seq, FrameRate::FPS_23_976.tick_of(4 * 24 + 6));
+            if s.path.take().is_some() {
+                s.previews.reset_temp();
+            }
             s.revision += 1;
             s.saved_revision = s.revision;
+            s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
             s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             s.events.push(crate::Event::OpenSequence(seq));
             Ok(json!({"sequence": seq.0}))
@@ -1056,7 +1061,7 @@ fn build() -> Vec<CommandSpec> {
             let path = str_p(p, "path").ok_or_else(|| bad("file.saveCopy", "need `path`"))?.to_string();
             write_project(s, &path, false)
         }),
-        cmd!("file.revert", "Revert", ["File"], None, "{}", has_saved_path, |s, _| {
+        cmd!("file.revert", "Revert", ["File"], None, r#"{"force":bool? (confirmed discard)}"#, has_saved_path, |s, _| {
             let path = s.path.clone().ok_or_else(|| bad("file.revert", "project was never saved"))?;
             let keep = s.state.active_sequence;
             let r = open_project(s, &path)?;
@@ -1066,11 +1071,14 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(r)
         }),
-        cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str}"#, always, |s, p| {
+        cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str,"force":bool? (confirmed discard)}"#, always, |s, p| {
             let path = str_p(p, "path").ok_or_else(|| bad("file.open", "need `path`"))?.to_string();
             open_project(s, &path)
         }),
-        cmd!("file.recover", "Recover Unsaved Changes…", ["File"], None, r#"{"id":str?}"#, has_recovery, |s, p| recover(s, str_p(p, "id"))),
+        cmd!("file.recover", "Recover Unsaved Changes…", ["File"], None, r#"{"id":str?,"force":bool? (confirmed discard)}"#, has_recovery, |s, p| recover(
+            s,
+            str_p(p, "id")
+        )),
         cmd!("file.discardRecovery", "Discard Unsaved Changes", [], None, r#"{"id":str?,"all":bool?}"#, has_recovery, |s, p| {
             let all = bool_p(p, "all").unwrap_or(false);
             let id = str_p(p, "id").map(str::to_string);
@@ -3349,35 +3357,52 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     let t0 = web_time::Instant::now();
-    // Save As renames the project after its new file (not an edit: no undo step, not dirty).
-    if adopt
-        && let Some(name) = project_name_for(path)
-        && s.project.name != name
+    // Serialize a detached candidate. A failed save must retain the active Arc and all history.
+    let mut candidate = s.project.clone();
+    let name = adopt.then(|| project_name_for(path)).flatten();
+    if let Some(name) = &name
+        && (candidate.name != *name || candidate.root.name != *name)
     {
-        name_project(std::sync::Arc::make_mut(&mut s.project), name);
+        name_project(std::sync::Arc::make_mut(&mut candidate), name.clone());
     }
     // what is open (sequence tabs, how each is shown) goes into the file beside the project
     let view = s.project_view();
-    let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
+    let bytes = filmcraft_format::encode_with_view(&candidate, Some(&view), false);
     let mut backup = None;
     if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::SCHEMA_VERSION {
         let b = schema_backup_path(path, s.loaded_schema);
-        if s.services.read_file(&b).is_err()
-            && let Ok(old) = s.services.read_file(path)
-        {
-            s.services.write_file(&b, &old).map_err(|e| EngineError::Other(format!("{b}: {e}")))?;
-            backup = Some(b);
+        match s.services.read_file(&b) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let old = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+                s.services.write_file(&b, &old).map_err(|e| EngineError::Other(format!("{b}: {e}")))?;
+                backup = Some(b);
+            }
+            Err(e) => return Err(EngineError::Other(format!("{b}: {e}"))),
         }
     }
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if adopt {
+        // Commit a live trim only after required writes succeed; failed SaveAs retains the
+        // transient state, active Arc, history and redo. The saved candidate already contains it.
+        s.settle_trim_playback("file.save");
+        s.project = candidate;
+        // File identity is not an edit. Retained undo/redo keep their content and labels while
+        // following the successfully adopted filename; no extra history step or revision.
+        if let Some(name) = name {
+            for (_, snapshot) in s.history.undo.iter_mut().chain(s.history.redo.iter_mut()) {
+                if snapshot.name != name || snapshot.root.name != name {
+                    name_project(std::sync::Arc::make_mut(snapshot), name.clone());
+                }
+            }
+        }
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();
         s.saved_revision = s.revision;
         s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
     }
-    Ok(json!({"path": path, "bytes": bytes.len(), "ms": t0.elapsed().as_secs_f64() * 1000.0, "backup": backup}))
+    Ok(json!({"outcome":"Saved", "path": path, "bytes": bytes.len(), "ms": t0.elapsed().as_secs_f64() * 1000.0, "backup": backup}))
 }
 
 fn schema_backup_path(path: &str, schema: u32) -> String {
@@ -3402,6 +3427,8 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
         && !cfg!(target_arch = "wasm32")
     {
         s.previews.set_dir(Some(crate::project_tools::previews_dir_for(&s.project, p)));
+    } else if path.is_none() {
+        s.previews.reset_temp();
     }
     s.path = path;
     s.revision += 1;
@@ -3439,21 +3466,22 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
         Some(id) => per.candidates.iter().position(|c| c.id == id).ok_or_else(|| bad("file.recover", format!("no recovery session `{id}`")))?,
         None => 0,
     };
-    let c = per.candidates[idx].clone();
+    let c = per.candidates.get(idx).cloned().ok_or_else(|| bad("file.recover", "no recovery session"))?;
     let saved_at = per.local_time(c.meta.saved_unix);
     let loaded = crate::autosave::load_candidate(&c).map_err(EngineError::Other)?;
+    let expected = s.revision.checked_add(1).ok_or_else(|| EngineError::Other("project revision exhausted".into()))?;
+    // Do not install or remove the old candidate until our own worker confirms both snapshot
+    // and metadata writes. A failed handoff retains its prior latest snapshot, not this candidate.
+    per.handoff(std::sync::Arc::new(loaded.project.clone()), expected, c.meta.project_path.clone()).map_err(EngineError::Other)?;
     install_project(s, loaded.project, c.meta.project_path.clone(), false);
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }
     crate::relink::on_open(s);
-    // Our own journal must hold the recovered state before the old one is deleted.
-    s.sync_persistence();
+    crate::autosave::discard_candidate(&c).map_err(|e| EngineError::Other(e.to_string()))?;
     if let Some(per) = s.persistence.as_mut() {
-        per.flush();
         per.candidates.remove(idx);
     }
-    crate::autosave::discard_candidate(&c).map_err(|e| EngineError::Other(e.to_string()))?;
     s.toast(format!("Recovered unsaved changes to {} from {saved_at}", c.meta.project_name));
     Ok(json!({"id": c.id, "name": c.meta.project_name, "path": c.meta.project_path, "savedAt": saved_at, "revision": c.meta.revision}))
 }

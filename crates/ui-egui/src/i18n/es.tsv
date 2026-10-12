@@ -3502,3 +3502,8 @@
 	Export cancelled	Exportación cancelada
 	Export failed: {error}	Error de exportación: {error}
 	The project changed. Start the export again to confirm its current settings.	El proyecto ha cambiado. Inicia la exportación de nuevo para confirmar su configuración actual.
+	Save cancelled.	Se ha cancelado el guardado.
+	Project saved.	Proyecto guardado.
+	The project changed. Start the action again to confirm its current state.	El proyecto ha cambiado. Inicia la acción de nuevo para confirmar su estado actual.
+	Save changes to '{name}' before continuing?	¿Guardar los cambios de «{name}» antes de continuar?
+	Project copy saved.	Copia del proyecto guardada.

@@ -318,6 +318,21 @@ pub enum Event {
     RevealInProject(ItemId),
 }
 
+/// Commands that replace the active project and may discard unsaved work.
+pub fn is_project_replacement(id: &str) -> bool {
+    matches!(
+        id,
+        "file.newProject"
+            | "file.openDemoProject"
+            | "file.open"
+            | "file.revert"
+            | "file.recover"
+            | "file.closeProject"
+            | "file.closeAllProjects"
+            | "file.newProjectFromTemplate"
+    )
+}
+
 pub struct Session {
     pub project: Arc<Project>,
     pub history: History,
@@ -617,7 +632,13 @@ impl Session {
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
+        // Check before settling a transient edit or touching persistence. UI, CLI and MCP all
+        // use this gate; callers grant discard consent only for their captured project state.
+        if is_project_replacement(id) && self.is_dirty() && params.get("force").and_then(Value::as_bool) != Some(true) {
+            return Err(EngineError::Other("the project has unsaved changes: save it first, or pass {\"force\": true} to discard them".into()));
+        }
+        let deferred_file = is_project_replacement(id) || matches!(id, "file.save" | "file.saveAs" | "file.saveCopy" | "file.saveAll");
+        if self.exec_depth == 0 && spec.journal && self.trim_play.active() && !deferred_file {
             self.settle_trim_playback(id);
         }
         if let Err(why) = self.enabled_for(spec, &params) {
@@ -634,6 +655,11 @@ impl Session {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        if r.is_ok() && is_project_replacement(id) {
+            // The old transient edit belongs to the discarded project. Failed reads/handoffs
+            // retain it; successful replacement drops it without adding history to the new one.
+            self.trim_play = Default::default();
+        }
         // source graphics: an edited instance updates the shared layers and the other instances
         if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
             graphic_templates::sync_source_graphics(self);

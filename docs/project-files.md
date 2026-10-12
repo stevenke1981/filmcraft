@@ -93,10 +93,11 @@ Every write of a project file, auto-save, recovery snapshot or preferences file 
 1. write the bytes to a hidden temp file in the **same directory** (`.<name>.<pid>-<n>.tmp`);
 2. `fsync` the temp file;
 3. rename it over the target (an atomic replace on every supported OS);
-4. `fsync` the directory so the rename itself is durable.
+4. attempt to sync the directory (best effort on hosts that do not support it).
 
-A crash, `kill -9` or power cut at any point leaves either the complete old file or the complete new
-one. If a step fails, the temp file is removed and the old file is untouched.
+Errors before the rename remove only the owned temp file and retain the old target. This is a
+per-file replacement, not an atomic transaction across a project and its schema backup or across
+recovery snapshot/metadata files. It does not guarantee durability against power loss.
 
 ## Commands
 
@@ -109,6 +110,38 @@ one. If a step fails, the temp file is removed and the old file is untouched.
 | `file.open {path}` | File ▸ Open Project… (⌘O) | returns `{schemaVersion, migrated}` |
 
 In the UI, Save / Save As / Save a Copy without a `path` show a file dialog.
+
+Save and Save As serialize a detached candidate with the destination filename as its project/root
+name. They adopt that identity, path, saved revision, schema and recent-project entry only after the
+required schema-backup and primary writes succeed. A failed write retains the active project Arc,
+editor state, dirty state, history and any dynamic trim. A completed schema backup can remain when
+the subsequent primary write fails; the original primary bytes are retained. Save a Copy adopts
+none of the file identity or clean state and leaves a live trim pending.
+
+After a successful Save As, retained undo/redo snapshots follow the new project/root name while
+keeping their edit contents, labels and stack lengths. Renaming is not an extra edit or revision.
+A live trim is committed only after a successful adopting save.
+
+Dirty New, Demo, Open, Revert, Recover, Close and New from Template share the engine's existing
+`force:true` convention for confirmed discard. Open and recovery candidates are read/decoded before
+installation; an invalid candidate leaves the active project intact. Demo owns no saved file path.
+The UI asks Save / Discard / Cancel and captures project Arc plus revision, rejecting a stale choice
+after another command changes the project. The stable dialog ids are `project.replace.save`,
+`project.replace.discard`, and `project.replace.cancel`. Save on a never-saved project uses the save
+picker. Only `Saved` continues a pending replacement; picker `Cancelled` and `Failed` retain the
+project. UI success/cancellation JSON includes `outcome: Saved|Cancelled`; failure remains an error.
+Engine save success adds `outcome: Saved` alongside the existing path/bytes/ms/backup fields. MCP v1
+create/open forwards `guard.confirm` to `force` and retains its atomic revision/workspace checks and
+explicit overwrite confirmation.
+
+Recovery requires a checked worker handoff: both its new snapshot and metadata must be written at
+the expected revision before installing the candidate and deleting the old journal. Write errors,
+disabled journaling, stopped workers and undelivered acknowledgements retain the candidate and
+restore the worker's prior latest snapshot for retry. A metadata failure can follow a successful
+snapshot write; restoration is retried if the same I/O obstruction prevents it. The snapshot and
+metadata are not a single atomic filesystem operation. If old-candidate cleanup fails after a
+successful handoff/install, the recovered project remains dirty with its new journal and the old
+candidate stays listed; the cleanup error is reported.
 
 ## Auto Save
 

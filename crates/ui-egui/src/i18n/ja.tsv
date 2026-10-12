@@ -944,3 +944,8 @@
 	Export cancelled	書き出しをキャンセルしました
 	Export failed: {error}	書き出しに失敗しました：{error}
 	The project changed. Start the export again to confirm its current settings.	プロジェクトが変更されました。書き出しを再開して現在の設定を確認してください。
+	Save cancelled.	保存をキャンセルしました。
+	Project saved.	プロジェクトを保存しました。
+	The project changed. Start the action again to confirm its current state.	プロジェクトが変更されました。操作を再開して現在の状態を確認してください。
+	Save changes to '{name}' before continuing?	続行する前に「{name}」の変更を保存しますか？
+	Project copy saved.	プロジェクトのコピーを保存しました。

@@ -154,6 +154,8 @@ pub enum Dialog {
     Recovery,
     /// "Are you sure you want to discard your changes?" (File ▸ Revert).
     RevertConfirm,
+    /// Save / Discard / Cancel before replacing the captured dirty project.
+    ProjectReplacement,
     /// Clip ▸ Audio Gain… (G).
     AudioGain,
     /// Sequence ▸ Delete Tracks….
@@ -1063,16 +1065,15 @@ impl FilmcraftApp {
                 }
                 r
             }
-            "file.saveAs" | "file.save" | "file.saveCopy" => {
-                let suggested =
-                    if id == "file.saveCopy" { format!("{} copy.fcproj", self.session.project.name) } else { format!("{}.fcproj", self.session.project.name) };
-                let Some(path) = self.hooks.pick_save.as_mut().and_then(|f| f(&suggested)) else { return Ok(Value::Null) };
-                let cmd = if id == "file.saveCopy" { "file.saveCopy" } else { "file.saveAs" };
-                self.session.execute(cmd, json!({"path": path})).map_err(|e| e.to_string())
-            }
+            "file.saveAs" | "file.save" | "file.saveCopy" => panels::file_dialogs::save_project(self, id, params).into_result(),
             "file.open" => {
-                let Some(path) = self.hooks.pick_open_project.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };
-                self.session.execute("file.open", json!({"path": path})).map_err(|e| e.to_string())
+                if !params.is_object() {
+                    return Err("project open params must be an object".into());
+                }
+                let Some(path) = self.hooks.pick_open_project.as_mut().and_then(|f| f()) else { return Ok(json!({"outcome":"Cancelled"})) };
+                let mut params = params.clone();
+                params["path"] = json!(path);
+                panels::file_dialogs::request_replacement(self, "file.open", params)
             }
             "graphics.newFromFile" => {
                 let exts: Vec<&str> = filmcraft_media::STILL_EXTENSIONS.iter().chain(filmcraft_media::VIDEO_EXTENSIONS).copied().collect();

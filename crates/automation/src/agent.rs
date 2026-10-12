@@ -405,6 +405,11 @@ impl FilmcraftMcp {
                     "explicit user confirmation is required; submit a new request_id with guard.confirm=true afterwards",
                 ));
             }
+            if matches!(id, "file.newProject" | "file.open") {
+                // Existing v1 consent reaches the common engine discard guard. agent.execute
+                // still checks this request's revision atomically before the replacement.
+                params["force"] = json!(guard.confirm);
+            }
             if !matches!(id, "file.newProject" | "file.open" | "jobs.cancel") {
                 let document = self.run_unchecked("project.document", json!({})).await.map_err(|e| error("APP_ERROR", e))?;
                 w.document(&document).map_err(|e| error("WORKSPACE_VIOLATION", e))?;
@@ -670,6 +675,113 @@ mod tests {
             })
             .await;
         assert_eq!(a["ok"], true, "{a}");
+        drop(s);
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn project_discard_consent_reaches_shared_guard_and_preserves_negative_cases() {
+        struct FailSave {
+            called: std::sync::atomic::AtomicBool,
+        }
+        impl filmcraft_engine::Services for FailSave {
+            fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+                filmcraft_engine::Services::read_file(&filmcraft_engine::FsServices, path)
+            }
+            fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+                if std::path::Path::new(path).file_name() == Some(std::ffi::OsStr::new("Failed.fcproj")) {
+                    self.called.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(std::io::Error::other("synthetic primary write failure"));
+                }
+                filmcraft_engine::Services::write_file(&filmcraft_engine::FsServices, path, bytes)
+            }
+        }
+        let (initial, root) = server("project-consent");
+        drop(initial);
+        let failure = Arc::new(FailSave { called: std::sync::atomic::AtomicBool::new(false) });
+        let mut session = Session::default();
+        session.services = failure.clone();
+        let s = FilmcraftMcp::headless(session).with_workspace(&root).unwrap();
+        let initial = s
+            .agent_edit(EditTimeline {
+                guard: guard("dirty", revision(&s).await, false),
+                edit: TimelineEdit::CreateSequence { name: "Unsaved".into(), width: 64, height: 36, fps: 24 },
+            })
+            .await;
+        assert_eq!(initial["ok"], true, "{initial}");
+        let before = s.agent_read(false).await;
+        let rev = revision(&s).await;
+        let denied =
+            s.agent_project(ProjectWrite { guard: guard("create-no", rev, false), action: ProjectAction::Create, name: Some("New".into()), path: None }).await;
+        assert_eq!(denied["error"]["code"], "CONFIRMATION_REQUIRED");
+        assert_eq!(s.agent_read(false).await, before);
+        let created =
+            s.agent_project(ProjectWrite { guard: guard("create-yes", rev, true), action: ProjectAction::Create, name: Some("New".into()), path: None }).await;
+        assert_eq!(created["ok"], true, "{created}");
+        let saved = s
+            .agent_project(ProjectWrite {
+                guard: guard("save-fresh", revision(&s).await, false),
+                action: ProjectAction::Save,
+                name: None,
+                path: Some("saved.fcproj".into()),
+            })
+            .await;
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(saved["result"]["outcome"], "Saved");
+        let bytes = std::fs::read(root.join("saved.fcproj")).unwrap();
+        let edited = s
+            .agent_edit(EditTimeline {
+                guard: guard("dirty-again", revision(&s).await, false),
+                edit: TimelineEdit::CreateSequence { name: "Second unsaved".into(), width: 64, height: 36, fps: 24 },
+            })
+            .await;
+        assert_eq!(edited["ok"], true, "{edited}");
+        let before = s.agent_read(false).await;
+        let rev = revision(&s).await;
+        let denied = s
+            .agent_project(ProjectWrite { guard: guard("open-no", rev, false), action: ProjectAction::Open, name: None, path: Some("saved.fcproj".into()) })
+            .await;
+        assert_eq!(denied["error"]["code"], "CONFIRMATION_REQUIRED");
+        assert_eq!(s.agent_read(false).await, before);
+        let stale = s
+            .agent_project(ProjectWrite {
+                guard: guard("open-stale", rev - 1, true),
+                action: ProjectAction::Open,
+                name: None,
+                path: Some("saved.fcproj".into()),
+            })
+            .await;
+        assert_eq!(stale["error"]["code"], "REVISION_CONFLICT");
+        assert_eq!(s.agent_read(false).await, before);
+        let overwrite = s
+            .agent_project(ProjectWrite {
+                guard: guard("overwrite-no", rev, false),
+                action: ProjectAction::Save,
+                name: None,
+                path: Some("saved.fcproj".into()),
+            })
+            .await;
+        assert_eq!(overwrite["error"]["code"], "CONFIRMATION_REQUIRED");
+        assert_eq!(std::fs::read(root.join("saved.fcproj")).unwrap(), bytes);
+        let failed = s
+            .agent_project(ProjectWrite {
+                guard: guard("save-io-failure", rev, false),
+                action: ProjectAction::Save,
+                name: None,
+                path: Some("Failed.fcproj".into()),
+            })
+            .await;
+        assert_eq!(failed["error"]["code"], "APP_ERROR", "{failed}");
+        assert!(failure.called.load(std::sync::atomic::Ordering::Relaxed), "oracle must reach the shared primary-write operation");
+        assert_eq!(s.agent_read(false).await, before, "failed native save cannot rename/adopt/clean the active App project");
+        assert_eq!(std::fs::read(root.join("saved.fcproj")).unwrap(), bytes);
+        let opened = s
+            .agent_project(ProjectWrite { guard: guard("open-yes", rev, true), action: ProjectAction::Open, name: None, path: Some("saved.fcproj".into()) })
+            .await;
+        assert_eq!(opened["ok"], true, "{opened}");
+        assert_eq!(opened["project"]["dirty"], false);
+        assert_eq!(opened["project"]["name"], "saved");
+        assert_eq!(std::fs::read(root.join("saved.fcproj")).unwrap(), bytes);
         drop(s);
         cleanup(root);
     }

@@ -111,7 +111,11 @@ fn a_project_saved_after_an_interchange_import_opens_again() {
     assert_eq!(motion_point(&first_clip(&t, seq), "position"), Vec2::new(960.0, 540.0));
     // without a link step the import is one undo step
     s.execute("edit.undo", json!({})).unwrap();
-    assert_eq!(*s.project, *before);
+    // SaveAs preserves the filename identity through content undo/redo.
+    let mut expected = (*before).clone();
+    expected.name = "p".into();
+    expected.root.name = "p".into();
+    assert_eq!(*s.project, expected);
     s.execute("edit.redo", json!({})).unwrap();
     assert_eq!(auto_points(&s.project), ["motion.anchor"]);
     let _ = std::fs::remove_dir_all(&d);
@@ -147,7 +151,11 @@ fn a_linked_clip_gets_its_anchor_from_the_real_size_of_the_media() {
     assert_eq!(s.project.source_size(clip.item), Some((3840, 2160)), "the size the document declared");
     assert!(motion_point(&clip, "anchor").x.is_nan());
     s.execute("edit.undo", json!({})).unwrap();
-    assert_eq!(*s.project, *before);
+    // SaveAs preserves the filename identity through content undo/redo.
+    let mut expected = (*before).clone();
+    expected.name = "p".into();
+    expected.root.name = "p".into();
+    assert_eq!(*s.project, expected);
     s.execute("edit.redo", json!({})).unwrap();
     s.execute("edit.redo", json!({})).unwrap();
     assert_eq!(*s.project, *linked);

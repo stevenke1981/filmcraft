@@ -164,10 +164,9 @@ impl NativeOutput {
         if entries.values().any(|entry| entry.required && !entry.ready) {
             return Err(ExportError::Io("export output has not been finalized; nothing was published".into()));
         }
-        let mut published = 0;
         // Only the image-sequence base path can remain unwritten; actual files must have been
         // flushed, synced and closed before they are eligible for publication.
-        for entry in entries.values().filter(|entry| entry.ready) {
+        for (published, entry) in entries.values().filter(|entry| entry.ready).enumerate() {
             let result = if entry.replace {
                 // std::fs::rename replaces a file on supported native platforms. Never pre-delete
                 // the old destination to make a failed replacement succeed.
@@ -183,7 +182,6 @@ impl NativeOutput {
                     entry.final_path.display()
                 )));
             }
-            published += 1;
         }
         self.published.store(true, Ordering::Release);
         Ok(())
@@ -283,7 +281,39 @@ mod tests {
         for (overwrite, bytes) in [(false, b"first".as_slice()), (true, b"replacement".as_slice())] {
             let output = NativeOutput::new(&path, overwrite, false).unwrap();
             output.write(&path, bytes).unwrap();
-            output.publish(&AtomicBool::new(false)).unwrap();
+            let publication = output.publish(&AtomicBool::new(false));
+            if let Err(error) = &publication {
+                let entries = output.entries.lock().unwrap_or_else(|e| e.into_inner());
+                eprintln!(
+                    "publication failure: error={error:?}, overwrite={overwrite}, configured_overwrite={}, expected_bytes={}, pid={}, cwd={:?}, temp={:?}, scratch={:?}, staging_directory={:?}, published={}, entries={}",
+                    output.overwrite,
+                    bytes.len(),
+                    std::process::id(),
+                    std::env::current_dir(),
+                    std::env::temp_dir(),
+                    dir.0,
+                    output.directory,
+                    output.published.load(Ordering::Acquire),
+                    entries.len()
+                );
+                for entry in entries.values() {
+                    eprintln!(
+                        "publication entry: operation={}, replace={}, ready={}, required={}, final={:?}, staged={:?}, final_exists={:?}, staged_exists={:?}, final_metadata={:?}, staged_metadata={:?}, parent_metadata={:?}",
+                        if entry.replace { "rename" } else { "hard_link" },
+                        entry.replace,
+                        entry.ready,
+                        entry.required,
+                        entry.final_path,
+                        entry.staged,
+                        entry.final_path.try_exists(),
+                        entry.staged.try_exists(),
+                        fs::symlink_metadata(&entry.final_path).map(|m| (m.is_file(), m.file_type().is_symlink(), m.len(), m.permissions().readonly())),
+                        fs::symlink_metadata(&entry.staged).map(|m| (m.is_file(), m.file_type().is_symlink(), m.len(), m.permissions().readonly())),
+                        fs::symlink_metadata(&dir.0).map(|m| (m.is_dir(), m.file_type().is_symlink(), m.permissions().readonly()))
+                    );
+                }
+            }
+            publication.unwrap();
             drop(output);
             assert_eq!(fs::read(&path).unwrap(), bytes);
             dir.only(&["new.mp4"]);

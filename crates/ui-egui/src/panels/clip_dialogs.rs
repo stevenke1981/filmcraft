@@ -92,6 +92,9 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
     if id == "file.closeProject" && !app.session.is_dirty() {
         return None;
     }
+    if id == "file.closeProject" {
+        return crate::panels::file_dialogs::route(app, id, params);
+    }
     meta(id)?;
     if let Err(e) = filmcraft_engine::find_command(id).map_or(Ok(()), |c| (c.enabled)(&app.session)) {
         app.ui.status = e.clone();
@@ -586,12 +589,14 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
         }
         Some("dontSave") | Some("save") => {
-            if action == Some("save")
-                && let Err(e) = app.session.execute("file.save", json!({}))
-            {
-                app.ui.status = e.to_string();
-                app.ui.clip_dialog = None;
-                return;
+            if action == Some("save") {
+                match crate::panels::file_dialogs::save_project(app, "file.save", &json!({})) {
+                    crate::panels::file_dialogs::SaveOutcome::Saved(_) => {}
+                    _ => {
+                        app.ui.clip_dialog = None;
+                        return;
+                    }
+                }
             }
             if let Err(e) = app.session.execute("file.closeProject", json!({"force": true})) {
                 app.ui.status = e.to_string();

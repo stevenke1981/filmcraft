@@ -892,3 +892,8 @@
 	Export cancelled	已取消匯出
 	Export failed: {error}	匯出失敗：{error}
 	The project changed. Start the export again to confirm its current settings.	專案已變更。請重新開始匯出，以確認目前的設定。
+	Save cancelled.	已取消儲存。
+	Project saved.	專案已儲存。
+	The project changed. Start the action again to confirm its current state.	專案已變更。請重新開始此操作，以確認目前的狀態。
+	Save changes to '{name}' before continuing?	繼續前要儲存「{name}」的變更嗎？
+	Project copy saved.	專案副本已儲存。

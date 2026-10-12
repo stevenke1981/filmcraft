@@ -2,6 +2,7 @@
 //! Subclip, Frame Hold Options, Modify ▸ Audio Channels, the Close Project prompt, and nested
 //! menus (Clip ▸ Video Options ▸ Time Interpolation).
 
+use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
@@ -182,13 +183,32 @@ fn close_project_prompt_and_nested_menus() {
     assert_eq!(d.v1(0).label, Label::Yellow);
     // the project is dirty: Close Project asks
     assert!(d.app().session.is_dirty());
-    assert_eq!(d.menu("file.closeProject")["dialog"], "closeProject");
-    assert!(d.has("closeProject.save") && d.has("closeProject.dontSave"));
-    d.click("closeProject.cancel");
-    assert!(!d.app().session.project.items.is_empty());
-    d.menu("file.closeProject");
-    d.click("closeProject.dontSave");
+    let project = d.app().session.project.clone();
+    let project_content = serde_json::to_value(&*project).unwrap();
+    let state = serde_json::to_value(&d.app().session.state).unwrap();
+    let revision = d.app().session.revision;
+    let saved_revision = d.app().session.saved_revision;
+    let path = d.app().session.path.clone();
+    assert_eq!(d.menu("file.closeProject")["dialog"], "projectReplacement");
+    for id in ["project.replace.save", "project.replace.discard", "project.replace.cancel"] {
+        assert!(d.has(id), "{id}");
+    }
+    d.click("project.replace.cancel");
+    assert!(Arc::ptr_eq(&project, &d.app().session.project), "Cancel preserves the active project Arc");
+    assert_eq!(serde_json::to_value(&*d.app().session.project).unwrap(), project_content);
+    assert_eq!(serde_json::to_value(&d.app().session.state).unwrap(), state);
+    assert_eq!(d.app().session.revision, revision);
+    assert_eq!(d.app().session.saved_revision, saved_revision);
+    assert_eq!(d.app().session.path, path);
+    assert!(d.app().session.is_dirty());
+    assert!(d.app().dialog.is_none(), "Cancel closes the prompt");
+    assert_eq!(d.menu("file.closeProject")["dialog"], "projectReplacement");
+    d.click("project.replace.discard");
     assert!(d.app().session.project.items.is_empty(), "closed without saving");
+    assert!(!d.app().session.is_dirty());
+    assert!(d.app().session.path.is_none());
+    assert!(d.app().session.active_sequence().is_none());
+    assert!(d.app().dialog.is_none());
     assert!(d.app().ui.clip_dialog.is_none());
 }
 

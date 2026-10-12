@@ -246,6 +246,12 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
     if let Some(r) = crate::panels::voiceover::route(app, ctx, id, &params) {
         return r;
     }
+    if let Some(r) = crate::panels::file_dialogs::route(app, id, &params) {
+        if let Err(e) = &r {
+            app.ui.status = e.clone();
+        }
+        return r;
+    }
     if let Some(r) = crate::panels::clip_dialogs::route(app, id, &params) {
         return r;
     }

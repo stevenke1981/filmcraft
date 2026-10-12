@@ -207,3 +207,128 @@ fn journal_costs_the_ui_thread_only_a_handoff() {
     s.shutdown();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+fn safety_state(s: &Session) -> Value {
+    json!({"project":*s.project,"state":s.state,"path":s.path,"revision":s.revision,"savedRevision":s.saved_revision,"schema":s.loaded_schema,
+        "undo":s.history.undo.iter().map(|(label,p)|json!([label,**p])).collect::<Vec<_>>(),
+        "redo":s.history.redo.iter().map(|(label,p)|json!([label,**p])).collect::<Vec<_>>()})
+}
+
+fn safety_candidate(data: &std::path::Path) -> Project {
+    let mut a = demo();
+    start(&mut a, data);
+    a.execute("sequence.addEdit", json!({"seconds": 3.0})).unwrap();
+    let project = (*a.project).clone();
+    a.persistence.take().unwrap().simulate_crash();
+    project
+}
+
+#[test]
+fn safety_recovery_handoff_write_failures_keep_candidate_and_current_state() {
+    for blocked in ["snapshot.fcproj", "session.json"] {
+        let d = temp_dir(&format!("safety-recover-{}", blocked.replace('.', "-")));
+        let recovered = safety_candidate(&d);
+        let mut s = demo();
+        start(&mut s, &d);
+        s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+        s.persistence.as_ref().unwrap().flush();
+        let candidate = s.recovery_candidates()[0].clone();
+        let old_bytes = std::fs::read(candidate.dir.join("snapshot.fcproj")).unwrap();
+        let old_meta = std::fs::read(candidate.dir.join("session.json")).unwrap();
+        let own_dir = s.persistence.as_ref().unwrap().session_dir.clone();
+        let obstruction = own_dir.join(blocked);
+        std::fs::remove_file(&obstruction).unwrap();
+        std::fs::create_dir(&obstruction).unwrap();
+        let before = safety_state(&s);
+        let arc = s.project.clone();
+        let sent = s.persistence.as_ref().unwrap().last_sent.clone();
+        let r = s.execute("file.recover", json!({"id":candidate.id,"force":true}));
+        assert!(r.is_err(), "{blocked} handoff was acknowledged despite failed journal: {r:?}");
+        println!("{blocked} failed handoff: {}", r.unwrap_err());
+        assert_eq!(safety_state(&s), before);
+        assert!(Arc::ptr_eq(&arc, &s.project));
+        assert_eq!(s.persistence.as_ref().unwrap().last_sent, sent, "failed handoff must not adopt candidate in dedup state");
+        assert_eq!(s.recovery_candidates().len(), 1);
+        assert_eq!(std::fs::read(candidate.dir.join("snapshot.fcproj")).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(candidate.dir.join("session.json")).unwrap(), old_meta);
+        // Removing only our synthetic obstruction lets the worker persist its PRIOR latest,
+        // including after a successful candidate snapshot followed by a failed metadata write.
+        std::fs::remove_dir(&obstruction).unwrap();
+        s.persistence.as_ref().unwrap().flush();
+        let own = filmcraft_format::decode(&std::fs::read(own_dir.join("snapshot.fcproj")).unwrap()).unwrap();
+        assert_eq!(own.project, *s.project);
+        assert_ne!(own.project, recovered);
+        let meta: Value = serde_json::from_slice(&std::fs::read(own_dir.join("session.json")).unwrap()).unwrap();
+        assert_eq!(meta["revision"], s.revision);
+        s.persistence.take().unwrap().simulate_crash();
+        let mut restart = Session::default();
+        start(&mut restart, &d);
+        assert_eq!(restart.recovery_candidates().len(), 2, "both the untouched candidate and current dirty state remain recoverable");
+        assert!(restart.recovery_candidates().iter().any(|c| c.id == candidate.id));
+        restart.shutdown();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn safety_recovery_disabled_journal_refuses_destructive_handoff() {
+    let d = temp_dir("safety-recovery-disabled");
+    safety_candidate(&d);
+    let mut s = Session::default();
+    start(&mut s, &d);
+    s.execute("prefs.set", json!({"key":"autoSave.recoveryJournal","value":false})).unwrap();
+    let candidate = s.recovery_candidates()[0].clone();
+    let before = safety_state(&s);
+    let arc = s.project.clone();
+    let r = s.execute("file.recover", json!({"id":candidate.id}));
+    assert!(r.is_err(), "recovery cannot discard its only journal when handoff is disabled: {r:?}");
+    assert_eq!(safety_state(&s), before);
+    assert!(Arc::ptr_eq(&s.project, &arc));
+    assert_eq!(s.recovery_candidates().len(), 1);
+    assert!(candidate.dir.join("snapshot.fcproj").is_file());
+    s.shutdown();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn safety_rejected_replacements_keep_dirty_journal_before_and_after_debounce() {
+    for settled in [false, true] {
+        for command in ["file.newProject", "file.openDemoProject", "file.open", "file.revert", "file.recover"] {
+            let d = temp_dir(&format!("safety-refused-{settled}-{}", command.replace('.', "-")));
+            safety_candidate(&d);
+            let path = d.join("active.fcproj").to_string_lossy().into_owned();
+            let mut s = demo();
+            if settled {
+                start(&mut s, &d);
+            } else {
+                let mut cfg = autosave::AutosaveConfig::new(&d);
+                cfg.journal_debounce = std::time::Duration::from_secs(600);
+                s.start_autosave(cfg).unwrap();
+            }
+            s.execute("file.saveAs", json!({"path":path})).unwrap();
+            s.execute("sequence.addEdit", json!({"seconds":1.0})).unwrap();
+            if settled {
+                s.persistence.as_ref().unwrap().flush();
+            }
+            let before = safety_state(&s);
+            let arc = s.project.clone();
+            if !settled {
+                assert!(!s.persistence.as_ref().unwrap().session_dir.join("snapshot.fcproj").exists(), "before-debounce phase requires no own snapshot yet");
+            }
+            let r = s.execute(command, json!({"path":path}));
+            assert!(r.is_err(), "{command} unexpectedly discarded dirty state: {r:?}");
+            assert_eq!(safety_state(&s), before);
+            assert!(Arc::ptr_eq(&arc, &s.project));
+            s.persistence.as_ref().unwrap().flush();
+            let own = s.persistence.as_ref().unwrap().session_dir.clone();
+            assert_eq!(filmcraft_format::decode(&std::fs::read(own.join("snapshot.fcproj")).unwrap()).unwrap().project, *s.project);
+            let edited = (*s.project).clone();
+            s.shutdown();
+            let mut restart = Session::default();
+            start(&mut restart, &d);
+            assert!(restart.recovery_candidates().iter().any(|c| crate::autosave::load_candidate(c).unwrap().project == edited));
+            restart.shutdown();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+}

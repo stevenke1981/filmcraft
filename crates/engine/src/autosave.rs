@@ -20,7 +20,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -629,6 +629,8 @@ enum Msg {
     Prefs(AutoSavePrefs),
     AutoSaveNow(Sender<Result<PathBuf, String>>),
     Flush(Sender<()>),
+    /// Recovery must have a confirmed new journal before adopting/deleting its candidate.
+    Handoff(Snapshot, SyncSender<Result<u64, String>>),
     Stop,
 }
 
@@ -757,6 +759,19 @@ impl Persistence {
         if self.tx.send(Msg::Flush(tx)).is_ok() {
             let _ = rx.recv_timeout(Duration::from_secs(30));
         }
+    }
+
+    /// Write a recovery candidate without first changing the session or its dedup state.
+    /// An error leaves the worker's prior latest snapshot available for retry/debounce.
+    pub(crate) fn handoff(&self, project: Arc<Project>, revision: u64, path: Option<String>) -> Result<(), String> {
+        // Success must mean receipt, not a queued reply after recv_timeout rejected the handoff.
+        let (tx, rx) = sync_channel(0);
+        self.tx.send(Msg::Handoff(Snapshot { project, revision, path }, tx)).map_err(|_| "recovery journal worker stopped".to_string())?;
+        let written = rx.recv_timeout(Duration::from_secs(30)).map_err(|e| format!("recovery journal acknowledgement: {e}"))??;
+        if written != revision {
+            return Err("recovery journal acknowledged a different revision".into());
+        }
+        Ok(())
     }
 
     /// Write an auto-save now (if there are unsaved changes) and wait for the result.
@@ -927,16 +942,31 @@ impl Worker {
                 }
                 Some(Msg::Flush(ack)) => {
                     if self.journal_due().is_some() {
-                        self.write_journal();
+                        let _ = self.write_journal();
                     }
                     let _ = ack.send(());
+                }
+                Some(Msg::Handoff(snapshot, ack)) => {
+                    if !self.prefs.recovery_journal {
+                        let _ = ack.send(Err("enable the recovery journal before recovering unsaved changes".into()));
+                    } else {
+                        let prior = self.latest.replace(snapshot);
+                        let result = self.write_journal();
+                        if result.is_err() {
+                            self.restore_handoff(prior);
+                            let _ = ack.send(result);
+                        } else if ack.send(result).is_err() {
+                            // The caller timed out/disconnected and did not adopt this candidate.
+                            self.restore_handoff(prior);
+                        }
+                    }
                 }
                 Some(Msg::Stop) => return,
                 None => {}
             }
             let now = Instant::now();
             if self.journal_due().is_some_and(|d| d <= now) {
-                self.write_journal();
+                let _ = self.write_journal();
             }
             if self.prefs.enabled && self.next_autosave <= now {
                 if self.latest.as_ref().is_some_and(|s| s.revision != self.autosaved) {
@@ -952,8 +982,24 @@ impl Worker {
         let _ = self.events.send(WorkerEvent::Error(e));
     }
 
-    fn write_journal(&mut self) {
-        let Some(s) = &self.latest else { return };
+    fn restore_handoff(&mut self, prior: Option<Snapshot>) {
+        self.latest = prior;
+        // A candidate snapshot may have replaced the old snapshot before its metadata failed.
+        // Force a full prior-state rewrite even when that prior revision was already journaled.
+        self.journaled = 0;
+        self.first_pending = self.latest.as_ref().map(|_| Instant::now());
+        self.last_change = Instant::now();
+        if self.latest.is_some() {
+            let _ = self.write_journal();
+        } else {
+            self.clear_journal();
+        }
+    }
+
+    fn write_journal(&mut self) -> Result<u64, String> {
+        let Some(s) = &self.latest else {
+            return Err("nothing to journal".into());
+        };
         let t0 = Instant::now();
         let bytes = filmcraft_format::encode(&s.project, false);
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -966,20 +1012,26 @@ impl Worker {
         meta.project_path = s.path.clone();
         meta.bytes = bytes.len();
         // Snapshot first, then the meta that makes it a candidate.
-        let r = filmcraft_format::atomic_write(&self.session_dir.join(SNAPSHOT), &bytes)
-            .and_then(|_| filmcraft_format::atomic_write(&self.session_dir.join(META), &serde_json::to_vec_pretty(&meta).unwrap_or_default()));
+        let r = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string()).and_then(|metadata| {
+            filmcraft_format::atomic_write(&self.session_dir.join(SNAPSHOT), &bytes)
+                .and_then(|_| filmcraft_format::atomic_write(&self.session_dir.join(META), &metadata))
+                .map_err(|e| e.to_string())
+        });
         let write_ms = t1.elapsed().as_secs_f64() * 1000.0;
         match r {
             Ok(()) => {
                 self.journaled = s.revision;
                 self.first_pending = None;
                 let _ = self.events.send(WorkerEvent::Journaled { revision: s.revision, unix, serialize_ms, write_ms, bytes: bytes.len() });
+                Ok(s.revision)
             }
             Err(e) => {
                 // Try again at the next interval rather than spinning.
                 self.first_pending = Some(Instant::now());
                 self.last_change = Instant::now();
-                self.error(format!("recovery journal: {e}"));
+                let error = format!("recovery journal: {e}");
+                self.error(error.clone());
+                Err(error)
             }
         }
     }
@@ -1037,5 +1089,92 @@ impl Worker {
                 Err(m)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn safety_timeout_with_live_receiver_rejects_a_queued_but_unreceived_ack() {
+        let data = std::env::temp_dir().join(format!("fc-safety-timeout-{}-{}", std::process::id(), unix_now()));
+        fs::create_dir(&data).unwrap();
+        let per = Persistence::start(&AutosaveConfig::new(&data), AutoSavePrefs::default()).unwrap();
+        per.send_dirty(Arc::new(Project::new("Current unsaved")), 7, None);
+        per.flush();
+        let snapshot = fs::read(per.session_dir.join(SNAPSHOT)).unwrap();
+        let (ack, receiver) = sync_channel(0);
+        // Force the caller's timeout-before-drop interval without a 30-second wait or a sleep.
+        assert!(matches!(receiver.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Timeout)));
+        per.tx.send(Msg::Handoff(Snapshot { project: Arc::new(Project::new("Unadopted recovery")), revision: 8, path: None }, ack)).unwrap();
+        assert!((0..4).any(|_| matches!(per.events.recv_timeout(Duration::from_secs(5)).unwrap(), WorkerEvent::Journaled { revision: 8, .. })));
+        // This FIFO barrier can finish only after the real Worker completes its acknowledgement.
+        // A timed-out but still-live receiver must not let the worker keep the candidate.
+        let (flushed, completed) = channel();
+        per.tx.send(Msg::Flush(flushed)).unwrap();
+        let progress_while_receiver_is_live = completed.recv_timeout(Duration::from_secs(2));
+        drop(receiver);
+        if progress_while_receiver_is_live.is_err() {
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let after: JournalMeta = serde_json::from_slice(&fs::read(per.session_dir.join(META)).unwrap()).unwrap();
+        println!(
+            "timeout/live receiver: worker completion={progress_while_receiver_is_live:?}, journal revision={}, project={}",
+            after.revision, after.project_name
+        );
+        assert!(
+            matches!(progress_while_receiver_is_live, Err(RecvTimeoutError::Timeout)),
+            "worker accepted an acknowledgement that the timed-out caller never received"
+        );
+        assert_eq!(fs::read(per.session_dir.join(SNAPSHOT)).unwrap(), snapshot);
+        assert_eq!(after.revision, 7);
+        assert_eq!(after.project_name, "Current unsaved");
+        per.close();
+        fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn safety_lost_ack_restores_prior_latest_and_stopped_worker_is_an_error() {
+        let data = std::env::temp_dir().join(format!("fc-safety-ack-{}-{}", std::process::id(), unix_now()));
+        fs::create_dir(&data).unwrap();
+        let mut per = Persistence::start(&AutosaveConfig::new(&data), AutoSavePrefs::default()).unwrap();
+        let prior = Arc::new(Project::new("Current unsaved"));
+        per.send_dirty(prior.clone(), 7, None);
+        per.flush();
+        let snapshot = fs::read(per.session_dir.join(SNAPSHOT)).unwrap();
+        let (ack, receiver) = sync_channel(0);
+        drop(receiver);
+        per.tx.send(Msg::Handoff(Snapshot { project: Arc::new(Project::new("Unadopted recovery")), revision: 8, path: None }, ack)).unwrap();
+        per.flush();
+        assert_eq!(fs::read(per.session_dir.join(SNAPSHOT)).unwrap(), snapshot, "undelivered success must restore the prior worker snapshot");
+        let meta: JournalMeta = serde_json::from_slice(&fs::read(per.session_dir.join(META)).unwrap()).unwrap();
+        assert_eq!(meta.revision, 7);
+        assert_eq!(meta.project_name, "Current unsaved");
+        per.stop_worker();
+        assert!(per.handoff(Arc::new(Project::new("Unadopted recovery")), 8, None).unwrap_err().contains("worker stopped"));
+        assert_eq!(fs::read(per.session_dir.join(SNAPSHOT)).unwrap(), snapshot);
+        per.close();
+        fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn safety_received_ack_keeps_the_written_candidate() {
+        let data = std::env::temp_dir().join(format!("fc-safety-received-{}-{}", std::process::id(), unix_now()));
+        fs::create_dir(&data).unwrap();
+        let per = Persistence::start(&AutosaveConfig::new(&data), AutoSavePrefs::default()).unwrap();
+        per.send_dirty(Arc::new(Project::new("Current unsaved")), 7, None);
+        per.flush();
+        let candidate = Arc::new(Project::new("Adopted recovery"));
+        per.handoff(candidate.clone(), 8, Some("recovered.fcproj".into())).unwrap();
+        per.flush();
+        let written = filmcraft_format::decode(&fs::read(per.session_dir.join(SNAPSHOT)).unwrap()).unwrap();
+        let meta: JournalMeta = serde_json::from_slice(&fs::read(per.session_dir.join(META)).unwrap()).unwrap();
+        assert_eq!(written.project, *candidate);
+        assert_eq!(meta.revision, 8);
+        assert_eq!(meta.project_name, "Adopted recovery");
+        assert_eq!(meta.project_path.as_deref(), Some("recovered.fcproj"));
+        per.close();
+        fs::remove_dir_all(&data).unwrap();
     }
 }
