@@ -23,10 +23,13 @@ from an input frame count.
 
 After every required output is flushed, synced and closed, publication uses:
 
-- A [hard link](https://doc.rust-lang.org/std/fs/fn.hard_link.html) for a destination absent when
-  it was reserved. This cannot overwrite a target that appears during rendering, even if the
-  invocation supplied generic confirmation. Filesystems without hard-link support return an I/O
-  error; there is no fallback to truncation or `exists()` followed by replacement.
+- A no-clobber move on Windows, using the safe API of pinned `tempfile 3.27.0`, and a
+  [hard link](https://doc.rust-lang.org/std/fs/fn.hard_link.html) on other native platforms for a
+  destination absent when it was reserved. A target that appears during rendering is preserved,
+  even if the invocation supplied generic confirmation. Windows avoids retaining and unlinking a
+  second name for a fresh final file. Unsupported filesystem operations return an I/O error; there
+  is no fallback to truncation or `exists()` followed by replacement. `NativeOutput` owns staging
+  cleanup on both success and failure; the helper never deletes a conflicting final path.
 - [Rename](https://doc.rust-lang.org/std/fs/fn.rename.html) for an existing single-file destination
   with explicit overwrite consent. There is no pre-delete fallback. Failed replacement leaves
   the existing file in place. Same-parent staging keeps source and destination on one filesystem.
@@ -70,6 +73,12 @@ constructor/error/drop cleanup, real Windows replacement failure, fresh no-clobb
 sidecar preservation, group publication failures, shared client reservations and native Windows
 case/Unicode aliases, consent propagation/invalidated UI consent, terminal UI outcomes and translation
 placeholder parity. Run Cargo with one build job and one test thread on a shared machine.
+
+Windows reproduction of the former hard-link/unlink workflow returned access-denied error5
+from both the initial rename and its native fallback, with the old final and replacement staging
+intact. The underlying kernel/filter cause remains unknown. The no-clobber fresh publication change
+addresses files newly published by this app; it does not guarantee replacement of historical or
+externally hard-linked targets. Confirmed replacement still reports OS sharing/permission failures.
 
 UI tests are engineering regressions, not native manual acceptance. Cross-process writers, other
 filesystems/platforms, process termination/power loss, and native desktop interaction require

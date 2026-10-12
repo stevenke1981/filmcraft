@@ -891,9 +891,24 @@ mod tests {
     }
 
     #[test]
-    fn intra_frames_decode_in_parallel_once_each() {
+    fn intra_distinct_cold_keys_decode_once_and_warm_requests_reuse_cache() {
         let s = Arc::new(samples(64, 1, 0, true));
         let c = Arc::new(GopCache::new(None));
+        // Same-PTS misses may duplicate work; singleflight is not promised. Distinct cold
+        // keys exercise four frame workers first, then the joined warm phase checks reuse
+        // without making its decode-count oracle depend on the operating system's schedule.
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                let (s, c) = (s.clone(), c.clone());
+                scope.spawn(move || {
+                    for k in 0..16usize {
+                        let i = k * 4 + t;
+                        assert_eq!(index_of(&c.frame(&*s, i as i64 * 1000).expect("cold frame")), i);
+                    }
+                });
+            }
+        });
+        assert_eq!(s.decodes.load(Ordering::Relaxed), 64, "each distinct cold key must decode exactly once");
         std::thread::scope(|scope| {
             for t in 0..4usize {
                 let (s, c) = (s.clone(), c.clone());
@@ -905,9 +920,50 @@ mod tests {
                 });
             }
         });
-        // a frame two threads miss at the same moment may decode twice; nothing more
-        assert!(s.decodes.load(Ordering::Relaxed) <= 64 + 4 * 4);
+        let decoded = s.decodes.load(Ordering::Relaxed);
+        let resets = s.resets.load(Ordering::Relaxed);
+        let (cached_pts, cached_bytes, spare_count) = {
+            let st = c.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (st.frames.keys().copied().collect::<Vec<_>>(), st.bytes, st.spare.len())
+        };
+        println!(
+            "GOP_INTRA_COLD_WARM decoded={decoded} resets={resets} cached_count={} cached_bytes={cached_bytes} spare_count={spare_count} cached_pts={cached_pts:?}",
+            cached_pts.len()
+        );
+        // Cross-worker warm requests must reuse the fully populated cache.
         assert_eq!(s.resets.load(Ordering::Relaxed), 0);
+        assert_eq!(decoded, 64, "warm requests must not decode the cold keys again");
+        assert_eq!(cached_pts, (0..64i64).map(|i| i * 1000).collect::<Vec<_>>(), "all 64 frames stay cached");
+        assert_eq!(cached_bytes, 256, "the complete 1x1 RGBA cache is 64 times 4 bytes");
+    }
+
+    #[test]
+    fn intra_mixed_cold_requests_preserve_pixels_and_cache_without_singleflight() {
+        let s = Arc::new(samples(64, 1, 0, true));
+        let c = Arc::new(GopCache::new(None));
+        // Preserve the original mixed-cold workload on a fresh cache. Same-PTS cold misses
+        // may decode more than once. Correctness must not depend on worker scheduling.
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                let (s, c) = (s.clone(), c.clone());
+                scope.spawn(move || {
+                    for k in 0..64usize {
+                        let i = (k * 7 + t * 16) % 64;
+                        assert_eq!(index_of(&c.frame(&*s, i as i64 * 1000).expect("frame")), i);
+                    }
+                });
+            }
+        });
+        let decoded = s.decodes.load(Ordering::Relaxed);
+        let resets = s.resets.load(Ordering::Relaxed);
+        let (cached_pts, cached_bytes) = {
+            let st = c.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (st.frames.keys().copied().collect::<Vec<_>>(), st.bytes)
+        };
+        println!("GOP_INTRA_MIXED_COLD decoded={decoded} resets={resets} cached_pts={cached_pts:?} cached_bytes={cached_bytes}");
+        assert_eq!(resets, 0);
+        assert_eq!(cached_pts, (0..64i64).map(|i| i * 1000).collect::<Vec<_>>(), "all requested frames stay cached");
+        assert_eq!(cached_bytes, 256);
     }
 
     #[test]

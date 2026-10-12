@@ -42,6 +42,19 @@ fn destination(path: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((final_path, key))
 }
 
+// NativeOutput remains the sole cleanup owner, including when publication fails.
+#[cfg(windows)]
+fn publish_new(staged: &Path, final_path: &Path) -> std::io::Result<()> {
+    let mut path = tempfile::TempPath::try_from_path(staged.to_path_buf())?;
+    path.disable_cleanup(true);
+    path.persist_noclobber(final_path).map_err(|error| error.error)
+}
+
+#[cfg(not(windows))]
+fn publish_new(staged: &Path, final_path: &Path) -> std::io::Result<()> {
+    fs::hard_link(staged, final_path)
+}
+
 #[derive(Debug)]
 struct Entry {
     final_path: PathBuf,
@@ -172,9 +185,9 @@ impl NativeOutput {
                 // the old destination to make a failed replacement succeed.
                 fs::rename(&entry.staged, &entry.final_path)
             } else {
-                // Unlike exists()+rename, hard_link cannot overwrite a target that appeared after
-                // reservation. Same-parent staging keeps both names on the same filesystem.
-                fs::hard_link(&entry.staged, &entry.final_path)
+                // Publishing a fresh path must refuse a target that appeared after reservation.
+                // Same-parent staging keeps both names on the same filesystem.
+                publish_new(&entry.staged, &entry.final_path)
             };
             if let Err(e) = result {
                 return Err(ExportError::Io(format!(
@@ -267,9 +280,15 @@ mod tests {
         let path = dir.path("new.mp4");
         let output = NativeOutput::new(&path, true, false).unwrap();
         output.write(&path, b"complete new output").unwrap();
+        let staged = output.stage_path(&path).unwrap();
         fs::write(&path, b"appeared while rendering").unwrap();
         assert!(output.publish(&AtomicBool::new(false)).is_err());
+        assert!(!output.published.load(Ordering::Acquire));
+        assert_eq!(fs::read(&path).unwrap(), b"appeared while rendering");
+        assert_eq!(fs::read(&staged).unwrap(), b"complete new output");
+        assert!(NativeOutput::new(&path, true, false).unwrap_err().to_string().contains("busy"));
         drop(output);
+        assert!(!staged.exists());
         assert_eq!(fs::read(&path).unwrap(), b"appeared while rendering");
         dir.only(&["new.mp4"]);
     }
@@ -299,7 +318,13 @@ mod tests {
                 for entry in entries.values() {
                     eprintln!(
                         "publication entry: operation={}, replace={}, ready={}, required={}, final={:?}, staged={:?}, final_exists={:?}, staged_exists={:?}, final_metadata={:?}, staged_metadata={:?}, parent_metadata={:?}",
-                        if entry.replace { "rename" } else { "hard_link" },
+                        if entry.replace {
+                            "rename"
+                        } else if cfg!(windows) {
+                            "move_noclobber"
+                        } else {
+                            "hard_link"
+                        },
                         entry.replace,
                         entry.ready,
                         entry.required,
@@ -384,12 +409,24 @@ mod tests {
         let output = NativeOutput::new(&path, false, false).unwrap();
         output.write(&sidecar, b"new captions").unwrap();
         output.write(&path, b"new video").unwrap();
+        let video_staged = output.stage_path(&path).unwrap();
+        let caption_staged = output.stage_path(&sidecar).unwrap();
         assert!(matches!(output.publish(&AtomicBool::new(true)), Err(ExportError::Cancelled)));
+        assert!(!output.published.load(Ordering::Acquire));
+        assert!(!Path::new(&path).exists());
+        assert!(!Path::new(&sidecar).exists());
+        assert_eq!(fs::read(&video_staged).unwrap(), b"new video");
+        assert_eq!(fs::read(&caption_staged).unwrap(), b"new captions");
         drop(output);
         dir.only(&[]);
         let output = NativeOutput::new(&path, false, false).unwrap();
         output.write(&sidecar, b"new captions").unwrap();
-        assert!(output.publish(&AtomicBool::new(false)).is_err());
+        let caption_staged = output.stage_path(&sidecar).unwrap();
+        assert!(output.publish(&AtomicBool::new(false)).unwrap_err().to_string().contains("not been finalized"));
+        assert!(!output.published.load(Ordering::Acquire));
+        assert!(!Path::new(&path).exists());
+        assert!(!Path::new(&sidecar).exists());
+        assert_eq!(fs::read(&caption_staged).unwrap(), b"new captions");
         drop(output);
         dir.only(&[]);
     }
@@ -399,15 +436,31 @@ mod tests {
         let dir = Scratch::new();
         let path = dir.path("fresh.mp4");
         let sidecar = dir.path("fresh.srt");
+        let later = dir.path("fresh.vtt");
         let output = NativeOutput::new(&path, true, false).unwrap();
         output.write(&path, b"complete video").unwrap();
         output.write(&sidecar, b"new captions").unwrap();
+        output.write(&later, b"later captions").unwrap();
+        let sidecar_staged = output.stage_path(&sidecar).unwrap();
+        let later_staged = output.stage_path(&later).unwrap();
         fs::write(&sidecar, b"external captions").unwrap();
         let error = output.publish(&AtomicBool::new(false)).unwrap_err().to_string();
         assert!(error.contains("1 complete new file(s) already published"), "{error}");
-        drop(output);
+        assert!(!output.published.load(Ordering::Acquire));
         assert_eq!(fs::read(&path).unwrap(), b"complete video");
         assert_eq!(fs::read(&sidecar).unwrap(), b"external captions");
+        assert!(!Path::new(&later).exists());
+        assert_eq!(fs::read(&sidecar_staged).unwrap(), b"new captions");
+        assert_eq!(fs::read(&later_staged).unwrap(), b"later captions");
+        output.cleanup_staging().unwrap();
+        assert!(!sidecar_staged.exists());
+        assert!(!later_staged.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"complete video");
+        assert_eq!(fs::read(&sidecar).unwrap(), b"external captions");
+        assert!(!Path::new(&later).exists());
+        assert!(NativeOutput::new(&later, false, false).unwrap_err().to_string().contains("busy"));
+        drop(output);
+        drop(NativeOutput::new(&later, false, false).unwrap());
         dir.only(&["fresh.mp4", "fresh.srt"]);
     }
 
@@ -469,11 +522,89 @@ mod tests {
         dir.only(&["old.mp4", "old.srt"]);
     }
 
+    #[test]
+    fn missing_ready_staging_cannot_publish_a_fresh_destination() {
+        let dir = Scratch::new();
+        let path = dir.path("fresh.mp4");
+        let output = NativeOutput::new(&path, false, false).unwrap();
+        output.write(&path, b"complete output").unwrap();
+        let staged = output.stage_path(&path).unwrap();
+        fs::remove_file(&staged).unwrap();
+        let error = output.publish(&AtomicBool::new(false)).unwrap_err().to_string();
+        assert!(error.contains("0 complete new file(s) already published"), "{error}");
+        assert!(!output.published.load(Ordering::Acquire));
+        assert!(!Path::new(&path).exists());
+        assert!(!staged.exists());
+        drop(output);
+        drop(NativeOutput::new(&path, false, false).unwrap());
+        dir.only(&[]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_locked_fresh_staging_survives_failure_until_owned_cleanup() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = Scratch::new();
+        let path = dir.path("fresh.mp4");
+        let output = NativeOutput::new(&path, false, false).unwrap();
+        output.write(&path, b"complete output").unwrap();
+        let staged = output.stage_path(&path).unwrap();
+        let directory = output.directory.clone();
+        let locked = OpenOptions::new().read(true).share_mode(3).open(&staged).unwrap();
+        assert!(output.publish(&AtomicBool::new(false)).is_err());
+        assert!(!output.published.load(Ordering::Acquire));
+        assert!(!Path::new(&path).exists());
+        assert_eq!(fs::read(&staged).unwrap(), b"complete output");
+        assert!(NativeOutput::new(&path, false, false).unwrap_err().to_string().contains("busy"));
+        drop(locked);
+        output.cleanup_staging().unwrap();
+        assert!(!staged.exists());
+        assert!(!directory.exists());
+        assert!(NativeOutput::new(&path, false, false).unwrap_err().to_string().contains("busy"));
+        drop(output);
+        drop(NativeOutput::new(&path, false, false).unwrap());
+        dir.only(&[]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unicode_temp_fresh_then_confirmed_publication_preserves_each_phase() {
+        let dir = Scratch::new();
+        let parent = dir.0.join("安全-名前");
+        fs::create_dir(&parent).unwrap();
+        let mut expected = Vec::new();
+        // Independent fixtures, never a retry of a failed publication.
+        for i in 0..100 {
+            let name = format!("影片-動画-{i:03}.mp4");
+            let path = parent.join(&name).to_str().unwrap().to_owned();
+            for (overwrite, bytes) in [(false, b"first".as_slice()), (true, b"replacement".as_slice())] {
+                let output = NativeOutput::new(&path, overwrite, false).unwrap();
+                let directory = output.directory.clone();
+                output.write(&path, bytes).unwrap();
+                output.publish(&AtomicBool::new(false)).unwrap();
+                assert!(output.published.load(Ordering::Acquire));
+                drop(output);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert!(!directory.exists());
+                assert!(NativeOutput::new(&path, false, false).unwrap_err().to_string().contains("confirmation"));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+            expected.push(name);
+            let mut actual: Vec<_> = fs::read_dir(&parent).unwrap().map(|e| e.unwrap().file_name().to_str().unwrap().to_owned()).collect();
+            actual.sort();
+            assert_eq!(actual, expected, "only complete final files remain after each fixture");
+        }
+        dir.only(&["安全-名前"]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_case_aliases_share_one_reservation() {
         let dir = Scratch::new();
         let output = NativeOutput::new(&dir.path("Target.MP4"), false, false).unwrap();
+        for name in ["Target.MP4.", "Target.MP4 ", "Target.MP4:stream"] {
+            assert!(NativeOutput::new(&dir.path(name), true, false).unwrap_err().to_string().contains("unsupported Windows file name"));
+        }
         assert!(NativeOutput::new(&dir.path("target.mp4"), true, false).unwrap_err().to_string().contains("busy"));
         drop(output);
         drop(NativeOutput::new(&dir.path("target.mp4"), false, false).unwrap());
@@ -520,10 +651,15 @@ mod tests {
         let locked = OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
         let output = NativeOutput::new(&path, true, false).unwrap();
         output.write(&path, b"replacement").unwrap();
+        let staged = output.stage_path(&path).unwrap();
         assert!(output.publish(&AtomicBool::new(false)).is_err());
+        assert!(!output.published.load(Ordering::Acquire));
         assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read(&staged).unwrap(), b"replacement");
         drop(output);
+        assert!(!staged.exists());
         drop(locked);
+        drop(NativeOutput::new(&path, true, false).unwrap());
         dir.only(&["old.mp4"]);
     }
 }
