@@ -332,3 +332,97 @@ fn safety_rejected_replacements_keep_dirty_journal_before_and_after_debounce() {
         }
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn review_recovery_cleanup_failure_drops_previous_live_trim() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    for moved in [false, true] {
+        for followup in ["tick", "cancel", "save"] {
+            let d = temp_dir(&format!("review-trim-recovery-{moved}-{followup}"));
+            let path_b = d.join("Recovered-B.fcproj").to_string_lossy().into_owned();
+            let mut b = demo();
+            start(&mut b, &d);
+            b.execute("file.saveAs", json!({"path":path_b})).unwrap();
+            b.execute("sequence.addEdit", json!({"seconds":3.0})).unwrap();
+            let recovered = (*b.project).clone();
+            b.persistence.take().unwrap().simulate_crash();
+
+            let path_a = d.join("Active-A.fcproj").to_string_lossy().into_owned();
+            let mut s = demo();
+            start(&mut s, &d);
+            s.execute("file.saveAs", json!({"path":path_a})).unwrap();
+            s.execute("sequence.addEdit", json!({"seconds":1.0})).unwrap();
+            let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+            s.execute("trim.selectEditPoint", json!({"clip":clip.0,"edge":"out","kind":"roll"})).unwrap();
+            s.execute("trim.shuttle", json!({"direction":"forward","clock":10.0})).unwrap();
+            if moved {
+                s.execute("trim.tick", json!({"clock":10.25})).unwrap();
+                assert!(s.trim_play.dynamic.as_ref().unwrap().offset > Tick::ZERO);
+            }
+            s.persistence.as_ref().unwrap().flush();
+            let candidate = s.recovery_candidates()[0].clone();
+            assert_eq!(candidate.meta.project_path.as_deref(), Some(path_b.as_str()));
+            let own_dir = s.persistence.as_ref().unwrap().session_dir.clone();
+
+            // Before-install failure must retain A, its live trim, history and prior journal.
+            let before = safety_state(&s);
+            let before_arc = s.project.clone();
+            let trim_before = s.execute("trim.monitor", json!({})).unwrap();
+            let obstruction = own_dir.join("snapshot.fcproj");
+            std::fs::remove_file(&obstruction).unwrap();
+            std::fs::create_dir(&obstruction).unwrap();
+            assert!(s.execute("file.recover", json!({"id":candidate.id,"force":true})).is_err());
+            assert_eq!(safety_state(&s), before);
+            assert!(Arc::ptr_eq(&s.project, &before_arc));
+            assert_eq!(s.execute("trim.monitor", json!({})).unwrap(), trim_before);
+            std::fs::remove_dir(&obstruction).unwrap();
+            s.persistence.as_ref().unwrap().flush();
+            assert_eq!(filmcraft_format::decode(&std::fs::read(own_dir.join("snapshot.fcproj")).unwrap()).unwrap().project, *s.project);
+
+            // A task-owned metadata handle denies deletion, after loading B and confirming its
+            // new journal. It does not block reading B or writing this session's journal.
+            let locked_metadata = std::fs::OpenOptions::new().read(true).share_mode(3).open(candidate.dir.join("session.json")).unwrap();
+            let revision = s.revision;
+            let result = s.execute("file.recover", json!({"id":candidate.id,"force":true}));
+            assert!(result.is_err(), "cleanup fixture must fail after install: {result:?}");
+            println!("{moved}/{followup}: cleanup error after install: {}", result.unwrap_err());
+            assert_eq!(*s.project, recovered, "B is installed before the cleanup error");
+            assert_eq!(s.path.as_deref(), Some(path_b.as_str()));
+            assert_eq!(s.revision, revision + 1);
+            assert_eq!(s.saved_revision, 0);
+            assert!(s.is_dirty());
+            assert!(s.history.undo.is_empty() && s.history.redo.is_empty());
+            assert_eq!(filmcraft_format::decode(&std::fs::read(own_dir.join("snapshot.fcproj")).unwrap()).unwrap().project, recovered);
+            let installed_arc = s.project.clone();
+            let installed_revision = s.revision;
+            match followup {
+                "tick" => {
+                    s.execute("trim.tick", json!({"clock":11.0})).unwrap();
+                }
+                "cancel" => {
+                    s.execute("trim.cancelDynamic", json!({})).unwrap();
+                }
+                "save" => {
+                    s.execute("file.save", json!({})).unwrap();
+                    assert_eq!(filmcraft_format::decode(&std::fs::read(&path_b).unwrap()).unwrap().project, recovered);
+                    assert!(!s.is_dirty());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(*s.project, recovered, "{moved}/{followup} resurrected discarded A after B was installed");
+            assert_eq!(s.path.as_deref(), Some(path_b.as_str()));
+            assert_eq!(s.revision, installed_revision, "no old trim edit belongs to B");
+            assert!(s.history.undo.is_empty() && s.history.redo.is_empty(), "no old A snapshot may enter B's history");
+            assert!(!s.trim_play.active(), "installation commits the old transient-state discard even when cleanup returns Err");
+            if followup != "save" {
+                assert!(Arc::ptr_eq(&s.project, &installed_arc));
+                assert!(s.is_dirty());
+            }
+            drop(locked_metadata);
+            s.shutdown();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+}

@@ -38,9 +38,18 @@ pub fn trim_mode(app: &FilmcraftApp) -> bool {
 /// Advance dynamic trimming / loop playback to the current UI time (once per frame).
 pub fn advance(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if !app.session.trim_play.active() {
+        app.file_dialogs.trim_clock_paused = false;
+        return;
+    }
+    if app.dialog == Some(crate::Dialog::ProjectReplacement) {
+        app.file_dialogs.trim_clock_paused = true;
         return;
     }
     let clock = ctx.input(|i| i.time);
+    if std::mem::take(&mut app.file_dialogs.trim_clock_paused) {
+        let playhead = app.session.playhead();
+        app.session.trim_play.rebase_clock(clock, playhead);
+    }
     if let Err(e) = app.session.execute("trim.tick", json!({"clock": clock})) {
         app.ui.status = e.to_string();
     }

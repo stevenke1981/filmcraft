@@ -15,6 +15,7 @@ use crate::{Dialog, FilmcraftApp};
 #[derive(Default)]
 pub struct FileDialogState {
     pub recovery_choice: usize,
+    pub(crate) trim_clock_paused: bool,
     pending: Option<PendingReplacement>,
 }
 
@@ -501,5 +502,136 @@ mod safety_tests {
             assert!(Arc::ptr_eq(&arc, &app.session.project));
         }
         assert_eq!(*picks.lock().unwrap(), 0);
+    }
+
+    fn review_frame_at(harness: &mut egui_kittest::Harness<'_, FilmcraftApp>, clock: f64) {
+        harness.input_mut().time = Some(clock);
+        harness.step();
+    }
+
+    fn review_key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn review_click(harness: &mut egui_kittest::Harness<'_, FilmcraftApp>, id: &str, clock: &mut f64) {
+        let rect = harness.state().auto.find(id).unwrap().rect;
+        let pos = egui::pos2(rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+        harness.input_mut().events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            *clock += 0.125;
+            review_frame_at(harness, *clock);
+        }
+    }
+
+    #[test]
+    fn review_replacement_modal_freezes_trim_clock_and_resumes_without_catchup() {
+        for mode in ["dynamic", "around"] {
+            for choice in ["cancel", "save-failed", "escape", "discard"] {
+                let (app, files) = app(true);
+                *files.fail.lock().unwrap() = choice == "save-failed";
+                let mut harness = egui_kittest::Harness::builder().with_size(vec2(1600.0, 980.0)).with_step_dt(0.125).build_eframe(move |_cc| app);
+                review_frame_at(&mut harness, 1.0);
+                review_frame_at(&mut harness, 1.125);
+                let clip = harness.state().session.active_sequence().unwrap().video_tracks[0].items[0].id;
+                harness.state_mut().session.execute("trim.selectEditPoint", json!({"clip":clip.0,"edge":"out","kind":"roll"})).unwrap();
+                let before_trim = harness.state().session.project.clone();
+                if mode == "dynamic" {
+                    harness.state_mut().session.execute("trim.shuttle", json!({"direction":"forward","clock":1.125})).unwrap();
+                } else {
+                    harness.state_mut().session.execute("trim.playAround", json!({"clock":1.125})).unwrap();
+                }
+                review_frame_at(&mut harness, 1.25);
+                review_frame_at(&mut harness, 1.375);
+                assert!(harness.state().session.trim_play.active());
+                let ctx = harness.ctx.clone();
+                assert_eq!(crate::menus::invoke(harness.state_mut(), &ctx, "file.closeProject", json!({})).unwrap()["dialog"], "projectReplacement");
+                let frozen = snapshot(harness.state());
+                let frozen_arc = harness.state().session.project.clone();
+                let dynamic = harness.state().session.trim_play.dynamic.as_ref().map(|d| (d.offset, d.speed, d.at_limit));
+                let disk = files.files.lock().unwrap().clone();
+
+                // Real App frames, not direct calls to the consent helper or trim advance.
+                // A transport key in the first modal frame must not bypass the modal either.
+                for (index, clock) in [2.375, 11.375, 31.375].into_iter().enumerate() {
+                    if index < 2 {
+                        harness.input_mut().events.push(review_key(egui::Key::L, index == 0));
+                    }
+                    review_frame_at(&mut harness, clock);
+                    println!("{mode}/{choice}: drawn replacement modal at clock {clock}");
+                    assert_eq!(harness.state().dialog, Some(Dialog::ProjectReplacement));
+                    assert_eq!(snapshot(harness.state()), frozen, "{mode}/{choice}: modal frame tick/shortcut mutated the captured project");
+                    assert!(Arc::ptr_eq(&harness.state().session.project, &frozen_arc));
+                    assert_eq!(harness.state().session.trim_play.dynamic.as_ref().map(|d| (d.offset, d.speed, d.at_limit)), dynamic);
+                    assert!(harness.state().session.trim_play.active(), "a modal must not commit or stop the old trim");
+                }
+                for id in ["project.replace.save", "project.replace.discard", "project.replace.cancel"] {
+                    assert!(harness.state().auto.find(id).is_some(), "actual dialog did not draw {id}");
+                }
+                let mut clock = 31.375;
+                match choice {
+                    "cancel" => review_click(&mut harness, "project.replace.cancel", &mut clock),
+                    "save-failed" => review_click(&mut harness, "project.replace.save", &mut clock),
+                    "discard" => review_click(&mut harness, "project.replace.discard", &mut clock),
+                    "escape" => {
+                        harness.input_mut().events.push(review_key(egui::Key::Escape, true));
+                        clock += 0.125;
+                        review_frame_at(&mut harness, clock);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(harness.state().dialog.is_none());
+                if choice == "discard" {
+                    assert!(harness.state().session.project.items.is_empty());
+                    assert!(harness.state().session.path.is_none());
+                    assert!(!harness.state().session.is_dirty());
+                    assert!(!harness.state().session.trim_play.active());
+                    assert!(!harness.state().ui.status.contains("The project changed"));
+                    continue;
+                }
+                if choice == "save-failed" {
+                    assert!(
+                        harness.state().ui.status.contains("synthetic save failure"),
+                        "actual Save must fail I/O, not reject its own stale consent: {}",
+                        harness.state().ui.status
+                    );
+                }
+                assert_eq!(snapshot(harness.state()), frozen, "{mode}/{choice}: choice must preserve the live state without committing trim");
+                assert!(Arc::ptr_eq(&harness.state().session.project, &frozen_arc));
+                assert_eq!(*files.files.lock().unwrap(), disk);
+                let before_position =
+                    if mode == "dynamic" { harness.state().session.trim_play.dynamic.as_ref().unwrap().offset } else { harness.state().session.playhead() };
+                let rate = harness.state().session.sequence_rate();
+                let step_bound = rate.tick_of(rate.frame_at(filmcraft_time::Tick::from_seconds_f64(0.125)) + 1);
+                clock += 0.125;
+                review_frame_at(&mut harness, clock);
+                let first_position =
+                    if mode == "dynamic" { harness.state().session.trim_play.dynamic.as_ref().unwrap().offset } else { harness.state().session.playhead() };
+                assert!(
+                    first_position >= before_position && first_position - before_position <= step_bound,
+                    "{mode}/{choice}: first resumed frame caught up the 30-second modal pause"
+                );
+                clock += 0.125;
+                review_frame_at(&mut harness, clock);
+                let next_position =
+                    if mode == "dynamic" { harness.state().session.trim_play.dynamic.as_ref().unwrap().offset } else { harness.state().session.playhead() };
+                assert!(
+                    next_position > first_position && next_position - first_position <= step_bound,
+                    "{mode}/{choice}: short-dt playback must remain usable after resuming"
+                );
+                assert_eq!(harness.state().session.history.undo.len(), frozen["undo"].as_array().unwrap().len());
+                assert_eq!(harness.state().session.history.redo.len(), frozen["redo"].as_array().unwrap().len());
+                // Dynamic cancellation still restores the original before snapshot: the dialog
+                // did not secretly commit it. Around cancellation leaves its project untouched.
+                harness.state_mut().session.execute("trim.cancelDynamic", json!({})).unwrap();
+                assert_eq!(*harness.state().session.project, *before_trim);
+                assert!(!harness.state().session.trim_play.active());
+            }
+        }
     }
 }

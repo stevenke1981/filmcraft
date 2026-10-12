@@ -367,6 +367,22 @@ impl TrimPlayback {
     pub fn active(&self) -> bool {
         self.dynamic.is_some() || self.around.is_some()
     }
+
+    /// Resume from the currently displayed trim position without counting a UI pause as play
+    /// time. Only clock anchors change: before snapshots, offsets, speed and history are kept.
+    pub fn rebase_clock(&mut self, clock: f64, playhead: Tick) {
+        if !clock.is_finite() {
+            return;
+        }
+        if let Some(dynamic) = &mut self.dynamic {
+            dynamic.anchor_clock = clock;
+            dynamic.anchor_offset = dynamic.offset;
+        }
+        if let Some(around) = &mut self.around {
+            let elapsed = Tick(playhead.0.saturating_sub(around.start.0)).seconds().max(0.0);
+            around.clock0 = clock - elapsed;
+        }
+    }
 }
 
 /// A J/K/L trim in progress.

@@ -1162,7 +1162,8 @@ impl FilmcraftApp {
                 hook(&items);
             }
         }
-        if ctx.egui_wants_keyboard_input() || self.dialog == Some(Dialog::Shortcuts) {
+        // Project replacement owns Escape and transport keys until its choice is handled.
+        if ctx.egui_wants_keyboard_input() || matches!(self.dialog, Some(Dialog::Shortcuts | Dialog::ProjectReplacement)) {
             return;
         }
         // Esc cancels a dynamic trim in progress

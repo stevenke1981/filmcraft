@@ -3418,6 +3418,9 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
     s.offline = Default::default();
     let first = proj.sequences().next().map(|i| i.id);
     s.project = std::sync::Arc::new(proj);
+    // This is the replacement commit. Recovery cleanup can still fail afterwards; the old
+    // project's transient before snapshot must never remain attached to the installed project.
+    s.trim_play = Default::default();
     s.history = Default::default();
     s.history.limit = 200;
     s.state = crate::Session::default().state;
